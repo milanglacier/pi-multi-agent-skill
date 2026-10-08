@@ -1,0 +1,1640 @@
+#!/usr/bin/env python3
+# multi_agent.py - start pi agents as separate `pi --mode rpc` processes and
+# manage each one as a named job.
+#
+# ../SKILL.md explains how an agent uses this script and ../reference.md lists
+# every command, option and state file.
+#
+# Stdlib only, Python 3.9+. Invoke as `python3 multi_agent.py ...` rather than
+# relying on the exec bit.
+
+import calendar
+import json
+import os
+import re
+import secrets
+import selectors
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import traceback
+
+# Prompts, job state and agent output are UTF-8 whatever the caller's locale.
+for _stream in (sys.stdin, sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
+
+SCRIPT_PATH = os.path.abspath(__file__)
+SKILL_DIR = os.path.dirname(os.path.dirname(SCRIPT_PATH))
+BUILTIN_PROFILES_DIR = os.path.join(SKILL_DIR, "profiles")
+
+RESULT_DELIMITER = "--- multi-agent ---"
+DEFAULT_PROFILE = "general-purpose"
+NAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9])?$")
+DIALOG_METHODS = ("select", "confirm", "input", "editor")
+STOP_SIGNALS = tuple(getattr(signal, n) for n in ("SIGTERM", "SIGHUP", "SIGINT") if hasattr(signal, n))
+# Removed from the agent's environment so the herdr extension inside the agent
+# does not report state for the caller's pane.
+REMOVED_ENV = ("HERDR_ENV", "HERDR_PANE_ID", "HERDR_SOCKET_PATH")
+NOT_RUNNING = "job is not running; use resume"
+
+BACKGROUND_TIMEOUT_S = 3600
+DEFAULT_MAX_DEPTH = 2
+INBOX_POLL_S = 0.5
+ACK_TIMEOUT_S = 10
+LAST_TEXT_TIMEOUT_S = 10
+SIGNAL_TEXT_TIMEOUT_S = 2
+SETTLE_TIMEOUT_S = 30
+PI_EXIT_GRACE_S = 10
+PI_TERM_GRACE_S = 5
+KILL_GRACE_S = 10
+# A run writes `status` before it starts the runner and records the
+# runner's pid right after. A job without a pid counts as running this long.
+START_GRACE_S = 10
+RECENT_S = 24 * 3600
+
+EXIT_OK = 0
+EXIT_FAIL = 1
+EXIT_STILL_RUNNING = 2
+EXIT_USAGE = 64
+
+MULTI_AGENT_BLOCK = """<multi-agent>
+You are an agent named {name}, started by another agent to work on one
+task. Whoever reads your result sees only your final message, so make it a
+complete, self-contained answer to the task. No person is available to
+answer questions. If a tool call is blocked because it needs approval, do
+not retry it; say in your final message what you could not do and why.
+</multi-agent>
+"""
+
+USAGE = """\
+Usage:
+  multi_agent.py run      [options] (PROMPT | -)
+  multi_agent.py resume   NAME [--background] [--timeout S] (PROMPT | -)
+  multi_agent.py wait     NAME [--timeout S]
+  multi_agent.py result   NAME
+  multi_agent.py steer    NAME (MESSAGE | -)
+  multi_agent.py abort    NAME
+  multi_agent.py kill     (NAME | --all)
+  multi_agent.py status   NAME
+  multi_agent.py peek     NAME [-n N]
+  multi_agent.py list     [--all]
+  multi_agent.py profiles
+  multi_agent.py rm       NAME
+
+Options for run:
+  --profile P     Profile name, matched case-insensitively (default general-purpose)
+  --name N        Job name (default <profile>-<4 hex digits>)
+  --background    Detach the runner and return immediately
+  --timeout S     Wall-clock limit in seconds (default 3600 in the background,
+                  none in the foreground; 0 means none)
+  --fork          Start from a copy of the caller's conversation ($PI_SESSION_FILE)
+  --model M       Model pattern passed to `pi --model`
+  --thinking L    Thinking level passed to `pi --thinking`
+  --cwd DIR       Working directory for the agent (default: the current directory)
+
+A PROMPT or MESSAGE of `-` is read from stdin. See reference.md for details."""
+
+
+class CommandError(Exception):
+    def __init__(self, message, code=EXIT_FAIL):
+        Exception.__init__(self, message)
+        self.code = code
+
+
+def usage_error(message):
+    return CommandError(message, EXIT_USAGE)
+
+
+def note(message):
+    sys.stderr.write("multi-agent: %s\n" % message)
+    sys.stderr.flush()
+
+
+# --- small helpers ---------------------------------------------------------
+
+
+def utcnow():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def parse_utc(text):
+    try:
+        return calendar.timegm(time.strptime(text.strip(), "%Y-%m-%dT%H:%M:%SZ"))
+    except (ValueError, AttributeError):
+        return None
+
+
+def read_text(path, default=None):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except OSError:
+        return default
+
+
+def read_json(path, default=None):
+    text = read_text(path)
+    if text is None:
+        return default
+    try:
+        return json.loads(text)
+    except ValueError:
+        return default
+
+
+def read_int(path):
+    try:
+        return int((read_text(path) or "").strip())
+    except ValueError:
+        return None
+
+
+def write_atomic(path, text):
+    """Write a state file through a temporary file and a rename.
+
+    The temporary name starts with a dot, which the inbox reader skips.
+    """
+    tmp = os.path.join(
+        os.path.dirname(path),
+        ".%s.tmp-%d-%d" % (os.path.basename(path), os.getpid(), threading.get_ident()),
+    )
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.replace(tmp, path)
+
+
+def remove(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def process_alive(pid, marker=None):
+    """Whether pid is a live process; with marker, also that its command line contains it.
+
+    The marker check keeps a recycled pid from passing for a runner or for pi
+    on systems with /proc.
+    """
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    proc_dir = "/proc/%d" % pid
+    if not os.path.isdir("/proc/self"):
+        return True
+    try:
+        with open(proc_dir + "/stat", "rb") as fh:
+            stat = fh.read()
+        if stat[stat.rfind(b")") + 2 :][:1] in (b"Z", b"X"):
+            return False
+        if marker is not None:
+            with open(proc_dir + "/cmdline", "rb") as fh:
+                if marker not in fh.read():
+                    return False
+    except OSError:
+        return False
+    return True
+
+
+def wait_for_exit(pid, marker, timeout):
+    end = time.monotonic() + timeout
+    while process_alive(pid, marker):
+        if time.monotonic() >= end:
+            return False
+        time.sleep(0.1)
+    return True
+
+
+def format_age(seconds):
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return "%ds" % seconds
+    if seconds < 3600:
+        return "%dm" % (seconds // 60)
+    if seconds < 86400:
+        return "%dh" % (seconds // 3600)
+    return "%dd" % (seconds // 86400)
+
+
+def excerpt(text, limit=120):
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+# --- locations ---------------------------------------------------------------
+
+
+def logical_cwd():
+    # Use $PWD when it names the current directory, so symlinked paths keep
+    # the name the caller used and the project slug stays stable.
+    pwd = os.environ.get("PWD")
+    if pwd and os.path.isabs(pwd):
+        try:
+            if os.path.samefile(pwd, "."):
+                return pwd
+        except OSError:
+            pass
+    return os.getcwd()
+
+
+def project_slug(path):
+    return re.sub(r"[^A-Za-z0-9]", "-", path).lstrip("-")
+
+
+def state_root():
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+    return os.path.abspath(os.path.join(base, "pi-multi-agent"))
+
+
+def pi_agent_dir():
+    return os.path.expanduser(os.environ.get("PI_CODING_AGENT_DIR") or os.path.join("~", ".pi", "agent"))
+
+
+def jobs_dir(project):
+    return os.path.join(state_root(), project_slug(project), "jobs")
+
+
+def sessions_dir(project):
+    return os.path.join(pi_agent_dir(), "multi-agent-sessions", project_slug(project))
+
+
+def pi_bin():
+    return os.environ.get("MULTI_AGENT_PI_BIN") or "pi"
+
+
+def find_session_file(session_dir, name):
+    """pi names a session file `<timestamp>_<id>.jsonl`; the timestamp has no `_`."""
+    pattern = re.compile(r"^[^_]+_" + re.escape(name) + r"\.jsonl$")
+    try:
+        entries = sorted(os.listdir(session_dir))
+    except OSError:
+        return []
+    return [os.path.join(session_dir, e) for e in entries if pattern.match(e)]
+
+
+# --- profiles ----------------------------------------------------------------
+
+
+def split_items(text):
+    """Split a comma-separated list, keeping commas inside quotes."""
+    items, current, quote = [], "", None
+    for ch in text:
+        if quote:
+            current += ch
+            if ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+            current += ch
+        elif ch == ",":
+            items.append(current)
+            current = ""
+        else:
+            current += ch
+    items.append(current)
+    return [item.strip() for item in items if item.strip()]
+
+
+def parse_scalar(raw):
+    value = raw.strip()
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        try:
+            return json.loads(value)
+        except ValueError:
+            return value[1:-1]
+    if len(value) >= 2 and value[0] == value[-1] == "'":
+        return value[1:-1].replace("''", "'")
+    if value.startswith("[") and value.endswith("]"):
+        return [parse_scalar(item) for item in split_items(value[1:-1])]
+    if value.lower() == "true":
+        return True
+    if value.lower() == "false":
+        return False
+    return value
+
+
+def parse_frontmatter(text):
+    """Return (fields, body) for a Markdown file with `---` frontmatter.
+
+    Supports `key: value` lines, quoted strings, true/false and `[a, b]`
+    lists. Indented lines (nested YAML) and comments are skipped.
+    """
+    lines = text.lstrip("﻿").splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}, text.strip()
+    end = None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            end = i
+            break
+    if end is None:
+        return {}, text.strip()
+    fields = {}
+    for line in lines[1:end]:
+        if not line.strip() or line.lstrip().startswith("#") or line[0] in " \t":
+            continue
+        key, sep, value = line.partition(":")
+        if sep and key.strip():
+            fields[key.strip()] = parse_scalar(value)
+    return fields, "\n".join(lines[end + 1 :]).strip()
+
+
+def tool_value(value):
+    """Join a tools field into pi's comma-separated form; None when unset or empty."""
+    if value is None or value is True or value is False:
+        return None
+    items = value if isinstance(value, list) else split_items(str(value))
+    joined = ",".join(str(item).strip() for item in items if str(item).strip())
+    return joined or None
+
+
+def text_field(fields, key):
+    value = fields.get(key)
+    if value is None or isinstance(value, (bool, list)):
+        return None
+    value = str(value).strip()
+    return value or None
+
+
+def make_profile(name, fields, body, source, scope):
+    return {
+        "name": name,
+        "description": text_field(fields, "description") or name,
+        "model": text_field(fields, "model"),
+        "thinking": text_field(fields, "thinking"),
+        "tools": tool_value(fields.get("tools")),
+        "disallowed_tools": tool_value(fields.get("disallowed_tools")),
+        "prompt_mode": (text_field(fields, "prompt_mode") or "append").lower(),
+        "enabled": fields.get("enabled") is not False,
+        "body": body,
+        "source": source,
+        "scope": scope,
+    }
+
+
+def profile_dirs(cwd):
+    return [
+        ("project", os.path.join(cwd, ".pi", "agents")),
+        ("user", os.path.join(pi_agent_dir(), "agents")),
+        ("builtin", BUILTIN_PROFILES_DIR),
+    ]
+
+
+def load_profiles(cwd):
+    """Map each lowercased profile name to the profile from the highest directory.
+
+    A profile replaces lower ones of the same name as a whole; a disabled one
+    hides them. Disabled entries stay in the map with enabled False.
+    """
+    found = {}
+    for scope, directory in profile_dirs(cwd):
+        try:
+            entries = sorted(os.listdir(directory))
+        except OSError:
+            continue
+        for entry in entries:
+            path = os.path.join(directory, entry)
+            if not entry.endswith(".md") or not os.path.isfile(path):
+                continue
+            text = read_text(path)
+            if text is None:
+                continue
+            fields, body = parse_frontmatter(text)
+            name = text_field(fields, "name") or entry[: -len(".md")]
+            found.setdefault(name.lower(), make_profile(name, fields, body, path, scope))
+    return found
+
+
+def find_profile(cwd, name):
+    profiles = load_profiles(cwd)
+    profile = profiles.get(name.lower())
+    if profile is None or not profile["enabled"]:
+        available = sorted(p["name"] for p in profiles.values() if p["enabled"])
+        raise CommandError("unknown profile: %s (available: %s)" % (name, ", ".join(available) or "none"))
+    if profile["prompt_mode"] not in ("append", "replace"):
+        raise CommandError(
+            "profile %s in %s: prompt_mode must be append or replace, got %s"
+            % (profile["name"], profile["source"], profile["prompt_mode"])
+        )
+    return profile
+
+
+def caller_model():
+    model = os.environ.get("PI_MODEL") or ""
+    provider = os.environ.get("PI_PROVIDER") or ""
+    if model and provider:
+        return provider + "/" + model
+    return model or None
+
+
+def resolve_model(option, profile):
+    return option or profile["model"] or caller_model()
+
+
+def resolve_thinking(option, profile):
+    return option or profile["thinking"] or os.environ.get("PI_REASONING_LEVEL") or None
+
+
+def profile_args(profile, model, thinking, prompt_file):
+    """pi arguments for a profile. In replace mode, writes the profile's prompt to prompt_file.
+
+    In append mode, the prompt reaches pi through append_prompt() instead.
+    """
+    args = []
+    if model:
+        args += ["--model", model]
+    if thinking:
+        args += ["--thinking", thinking]
+    if profile["tools"]:
+        args += ["--tools", profile["tools"]]
+    if profile["disallowed_tools"]:
+        args += ["-xt", profile["disallowed_tools"]]
+    if profile["prompt_mode"] == "replace":
+        write_atomic(prompt_file, profile["body"] + "\n")
+        args += ["--system-prompt", prompt_file, "-nc"]
+    return args
+
+
+def append_prompt(profile, name):
+    """Text passed with --append-system-prompt: the profile's prompt in append
+    mode, then the multi-agent block."""
+    parts = []
+    if profile["prompt_mode"] == "append" and profile["body"]:
+        parts.append(profile["body"])
+    parts.append(MULTI_AGENT_BLOCK.format(name=name).strip())
+    return "\n\n".join(parts) + "\n"
+
+
+# --- job state ---------------------------------------------------------------
+
+
+def validate_name(name):
+    if not NAME_RE.match(name):
+        raise usage_error(
+            "invalid job name: %r (use letters, digits, '.', '_' and '-', start and end with a"
+            " letter or digit, at most 64 characters)" % name
+        )
+
+
+def default_name(profile_name):
+    base = re.sub(r"[^a-z0-9._-]+", "-", profile_name.lower()).strip("._-")[:59] or "agent"
+    return "%s-%s" % (base, secrets.token_hex(2))
+
+
+def job_path(job_dir, name):
+    return os.path.join(job_dir, name)
+
+
+def job_status(job_dir):
+    """The job's status, with `died` (or `killed`) for a runner that vanished."""
+    status = (read_text(job_path(job_dir, "status"), "") or "").strip() or "unknown"
+    if status != "running" or os.path.exists(job_path(job_dir, "exit_code")):
+        return status
+    runner = read_int(job_path(job_dir, "runner_pid"))
+    if runner is None:
+        started = parse_utc(read_text(job_path(job_dir, "started_at"), "") or "")
+        if started is not None and time.time() - started < START_GRACE_S:
+            return "running"
+    elif process_alive(runner, b"multi_agent"):
+        return "running"
+    return "killed" if os.path.exists(job_path(job_dir, "killed")) else "died"
+
+
+def find_job(name):
+    """Look a job up in the current project, then in all projects."""
+    validate_name(name)
+    direct = os.path.join(jobs_dir(logical_cwd()), name)
+    if os.path.isdir(direct):
+        return direct
+    matches = []
+    try:
+        projects = sorted(os.listdir(state_root()))
+    except OSError:
+        projects = []
+    for project in projects:
+        candidate = os.path.join(state_root(), project, "jobs", name)
+        if os.path.isdir(candidate):
+            matches.append(candidate)
+    if len(matches) == 1:
+        return matches[0]
+    if matches:
+        raise CommandError(
+            "job %s exists in several projects; run the command from the project's directory:\n  %s"
+            % (name, "\n  ".join(matches))
+        )
+    raise CommandError("unknown job: %s" % name)
+
+
+def model_label(job_dir, job):
+    used = (read_text(job_path(job_dir, "model"), "") or "").strip()
+    return used or job.get("model") or "(pi default)"
+
+
+def duration_s(job_dir):
+    started = parse_utc(read_text(job_path(job_dir, "started_at"), "") or "")
+    ended = parse_utc(read_text(job_path(job_dir, "ended_at"), "") or "")
+    if started is None:
+        return None
+    return int((ended if ended is not None else time.time()) - started)
+
+
+def format_result(job_dir, status):
+    job = read_json(job_path(job_dir, "job.json"), {})
+    output = (read_text(job_path(job_dir, "output.txt"), "") or "").rstrip("\n")
+    duration = duration_s(job_dir)
+    return "%s\n\n%s\nname: %s\nstatus: %s\nprofile: %s\nmodel: %s\nduration_s: %s\n" % (
+        output if output.strip() else "(no output)",
+        RESULT_DELIMITER,
+        os.path.basename(job_dir),
+        status,
+        job.get("profile", "?"),
+        model_label(job_dir, job),
+        "?" if duration is None else duration,
+    )
+
+
+def print_result(job_dir, status):
+    try:
+        sys.stdout.write(format_result(job_dir, status))
+        sys.stdout.flush()
+    except OSError:
+        # The caller's stdout may be gone when a signal stopped the run.
+        pass
+    return EXIT_OK if status == "done" else EXIT_FAIL
+
+
+def append_progress(job_dir, message):
+    line = "%s %s\n" % (time.strftime("%H:%M:%S"), message)
+    try:
+        with open(job_path(job_dir, "progress.log"), "a", encoding="utf-8") as fh:
+            fh.write(line)
+    except OSError:
+        pass
+
+
+# --- runner ------------------------------------------------------------------
+
+
+def child_env(job_dir, job):
+    env = dict(os.environ)
+    for key in REMOVED_ENV:
+        env.pop(key, None)
+    env["MULTI_AGENT_JOB"] = job_dir
+    env["MULTI_AGENT_DEPTH"] = str(job["depth"])
+    env["PI_MINIMAL_PERMISSION_SYSTEM_NONINTERACTIVE"] = "1"
+    env["PWD"] = job["cwd"]
+    return env
+
+
+def pi_argv(job_dir, job):
+    argv = [pi_bin(), "--mode", "rpc", "--session-dir", job["session_dir"]]
+    if job.get("fork") and job.get("run_kind") == "new":
+        argv += ["--fork", job["fork"]]
+    argv += ["--session-id", job["name"]]
+    argv += job["pi_args"]
+    argv += ["--append-system-prompt", job_path(job_dir, "append-prompt.md")]
+    return argv
+
+
+def short_args(args):
+    if isinstance(args, dict):
+        for key in ("command", "path", "file_path", "pattern", "query", "url"):
+            value = args.get(key)
+            if isinstance(value, str) and value:
+                return excerpt(value)
+    return excerpt(json.dumps(args, ensure_ascii=False, separators=(",", ":")))
+
+
+class Runner:
+    """Owns one pi RPC process for one run of a job.
+
+    caller_fd is the read end of a pipe whose only write end the foreground
+    `run` process holds. End of file on it means that process has ended, for
+    any reason, SIGKILL included, and the run stops.
+    """
+
+    def __init__(self, job_dir, caller_fd=None):
+        self.job_dir = job_dir
+        self.job = read_json(job_path(job_dir, "job.json"))
+        self.prompt = read_text(job_path(job_dir, "prompt.txt"), "")
+        self.caller_fd = caller_fd
+        self.caller_gone = False
+        self.proc = None
+        self.out_fd = None
+        self.buffer = b""
+        self.eof = False
+        self.stdin_open = False
+        self.selector = selectors.DefaultSelector()
+        self.wake_r = None
+        self.signum = None
+        self.serial = 0
+        self.responses = {}
+        self.prompt_response = None
+        self.pending_acks = {}
+        self.taken = set()
+        self.settled = False
+        self.last_stop = None
+        self.last_error = None
+        self.model_used = None
+        self.usage = read_json(job_path(job_dir, "usage.json"), None) or {}
+        self.abort_sent = False
+        self.abort_requested = False
+        self.timing_out = False
+        self.stop_deadline = None
+        self.finishing = False
+
+    # -- process and pipes --
+
+    def install_signals(self):
+        wake_r, wake_w = os.pipe()
+        os.set_blocking(wake_r, False)
+        os.set_blocking(wake_w, False)
+        self.wake_r = wake_r
+        signal.set_wakeup_fd(wake_w, warn_on_full_buffer=False)
+        self.selector.register(wake_r, selectors.EVENT_READ)
+
+        def on_signal(signum, _frame):
+            if self.signum is None:
+                self.signum = signum
+
+        for signum in STOP_SIGNALS:
+            # An ignored signal stays ignored, so `nohup` keeps working.
+            if signal.getsignal(signum) is not signal.SIG_IGN:
+                signal.signal(signum, on_signal)
+
+    def watch_caller(self):
+        if self.caller_fd is None:
+            return
+        os.set_inheritable(self.caller_fd, False)
+        os.set_blocking(self.caller_fd, False)
+        self.selector.register(self.caller_fd, selectors.EVENT_READ)
+
+    def read_caller(self):
+        try:
+            data = os.read(self.caller_fd, 512)
+        except BlockingIOError:
+            return
+        except OSError:
+            data = b""
+        if not data:
+            self.caller_gone = True
+            self.selector.unregister(self.caller_fd)
+            os.close(self.caller_fd)
+            self.caller_fd = None
+
+    def start(self):
+        stderr_fh = open(job_path(self.job_dir, "stderr.txt"), "wb")
+        try:
+            self.proc = subprocess.Popen(
+                pi_argv(self.job_dir, self.job),
+                cwd=self.job["cwd"],
+                env=child_env(self.job_dir, self.job),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=stderr_fh,
+                # pi gets its own session, so signals for the runner's process
+                # group never reach it; the runner stops it through its stdin.
+                start_new_session=True,
+            )
+        finally:
+            stderr_fh.close()
+        write_atomic(job_path(self.job_dir, "pi_pid"), "%d\n" % self.proc.pid)
+        self.stdin_open = True
+        self.out_fd = self.proc.stdout.fileno()
+        self.selector.register(self.out_fd, selectors.EVENT_READ)
+
+    def send(self, obj):
+        if not self.stdin_open:
+            return False
+        try:
+            self.proc.stdin.write(json.dumps(obj).encode("utf-8") + b"\n")
+            self.proc.stdin.flush()
+            return True
+        except OSError:
+            self.stdin_open = False
+            return False
+
+    def close_stdin(self):
+        if self.proc is not None and self.proc.stdin is not None:
+            try:
+                self.proc.stdin.close()
+            except OSError:
+                pass
+        self.stdin_open = False
+
+    def new_id(self, kind):
+        self.serial += 1
+        return "%s-%d" % (kind, self.serial)
+
+    def pump(self, timeout):
+        """Read what pi has written within timeout and handle complete records."""
+        for key, _events in self.selector.select(max(0.0, timeout)):
+            if key.fd == self.wake_r:
+                try:
+                    while os.read(self.wake_r, 512):
+                        pass
+                except OSError:
+                    pass
+                continue
+            if key.fd == self.caller_fd:
+                self.read_caller()
+                continue
+            try:
+                data = os.read(self.out_fd, 65536)
+            except OSError:
+                data = b""
+            if not data:
+                self.eof = True
+                self.selector.unregister(self.out_fd)
+                if self.buffer:
+                    self.handle_line(self.buffer)
+                    self.buffer = b""
+                continue
+            self.buffer += data
+            # Records end at LF only. U+2028 and U+2029 are valid inside JSON strings.
+            while b"\n" in self.buffer:
+                line, self.buffer = self.buffer.split(b"\n", 1)
+                self.handle_line(line)
+
+    def handle_line(self, line):
+        line = line.rstrip(b"\r")
+        if not line.strip():
+            return
+        try:
+            record = json.loads(line.decode("utf-8", "replace"))
+        except ValueError:
+            return
+        if isinstance(record, dict):
+            self.handle(record)
+
+    def handle(self, record):
+        kind = record.get("type")
+        if kind == "response":
+            rid = record.get("id")
+            if rid == "prompt":
+                self.prompt_response = record
+            elif rid in self.pending_acks:
+                base = self.pending_acks.pop(rid)
+                if record.get("success"):
+                    disposition = (record.get("data") or {}).get("disposition") or "queued"
+                    self.ack(base, {"ok": True, "disposition": disposition})
+                else:
+                    self.ack(base, {"ok": False, "error": record.get("error") or "steer failed"})
+            elif rid is not None:
+                self.responses[rid] = record
+        elif kind == "tool_execution_start":
+            self.progress("%s %s" % (record.get("toolName", "?"), short_args(record.get("args"))))
+        elif kind == "message_end":
+            message = record.get("message") or {}
+            if message.get("role") == "assistant":
+                self.on_assistant_message(message)
+        elif kind == "auto_retry_start":
+            self.progress(
+                "retry %s/%s: %s"
+                % (record.get("attempt"), record.get("maxAttempts"), excerpt(record.get("errorMessage") or ""))
+            )
+        elif kind == "compaction_start":
+            self.progress("compaction (%s)" % record.get("reason", "?"))
+        elif kind == "extension_ui_request" and record.get("method") in DIALOG_METHODS:
+            # No person can answer. Without a reply the extension would wait, often forever.
+            self.send({"type": "extension_ui_response", "id": record.get("id"), "cancelled": True})
+            self.progress("denied: %s" % excerpt(record.get("title") or record.get("method")))
+        elif kind == "agent_settled":
+            self.settled = True
+
+    def on_assistant_message(self, message):
+        self.last_stop = message.get("stopReason")
+        self.last_error = message.get("errorMessage")
+        if message.get("provider") and message.get("model"):
+            self.model_used = "%s/%s" % (message["provider"], message["model"])
+        elif message.get("model"):
+            self.model_used = message["model"]
+        usage = message.get("usage") or {}
+        for key in ("input", "output", "cacheRead", "cacheWrite", "totalTokens"):
+            if isinstance(usage.get(key), (int, float)):
+                self.usage[key] = self.usage.get(key, 0) + usage[key]
+        cost = (usage.get("cost") or {}).get("total")
+        if isinstance(cost, (int, float)):
+            self.usage["cost"] = round(self.usage.get("cost", 0) + cost, 6)
+
+    def progress(self, message):
+        append_progress(self.job_dir, message)
+
+    def request(self, command, timeout):
+        rid = self.new_id(command["type"])
+        if not self.send(dict(command, id=rid)):
+            return None
+        end = time.monotonic() + timeout
+        while rid not in self.responses and not self.eof:
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                break
+            self.pump(min(0.2, remaining))
+        return self.responses.pop(rid, None)
+
+    # -- control inbox --
+
+    def ack(self, base, reply):
+        inbox = job_path(self.job_dir, "inbox")
+        try:
+            write_atomic(os.path.join(inbox, base + ".ack"), json.dumps(reply) + "\n")
+        except OSError:
+            pass
+        remove(os.path.join(inbox, base + ".json"))
+
+    def check_inbox(self):
+        inbox = job_path(self.job_dir, "inbox")
+        try:
+            entries = sorted(e for e in os.listdir(inbox) if e.endswith(".json") and not e.startswith("."))
+        except OSError:
+            return
+        for entry in entries:
+            if entry in self.taken:
+                continue
+            self.taken.add(entry)
+            base = entry[: -len(".json")]
+            request = read_json(os.path.join(inbox, entry), {})
+            kind = request.get("type") if isinstance(request, dict) else None
+            if self.finishing or self.settled:
+                self.ack(base, {"ok": False, "error": NOT_RUNNING})
+            elif kind == "steer":
+                message = str(request.get("message", ""))
+                rid = self.new_id("steer")
+                if self.send({"id": rid, "type": "steer", "message": message}):
+                    self.pending_acks[rid] = base
+                    self.progress("steer: %s" % excerpt(message))
+                else:
+                    self.ack(base, {"ok": False, "error": NOT_RUNNING})
+            elif kind == "abort":
+                self.abort_requested = True
+                self.progress("abort requested")
+                self.send_abort()
+                self.ack(base, {"ok": True, "disposition": "requested"})
+            else:
+                self.ack(base, {"ok": False, "error": "unknown request type: %s" % kind})
+
+    def send_abort(self):
+        if self.abort_sent:
+            return
+        self.abort_sent = True
+        # pi continues with queued messages after an abort unless the queue is cleared.
+        self.send({"id": self.new_id("clear_queue"), "type": "clear_queue"})
+        self.send({"id": self.new_id("abort"), "type": "abort"})
+        self.stop_deadline = time.monotonic() + SETTLE_TIMEOUT_S
+
+    # -- the run --
+
+    def run(self):
+        self.install_signals()
+        self.watch_caller()
+        try:
+            self.start()
+        except OSError as exc:
+            return self.conclude("failed", "could not start %s: %s" % (pi_bin(), exc))
+        self.progress("run %s started (%s)" % (read_int(job_path(self.job_dir, "runs")), self.job["mode"]))
+        self.send({"id": "prompt", "type": "prompt", "message": self.prompt})
+
+        timeout = self.job.get("timeout")
+        deadline = time.monotonic() + timeout if timeout else None
+        next_inbox = 0.0
+        while True:
+            if self.signum is not None:
+                return self.finish_killed("stopped by %s" % signal.Signals(self.signum).name)
+            if self.caller_gone:
+                return self.finish_killed("stopped: the caller's command ended")
+            now = time.monotonic()
+            if deadline is not None and now >= deadline and not self.timing_out:
+                self.timing_out = True
+                self.progress("timeout after %ss; aborting" % format_seconds(timeout))
+                self.send_abort()
+            if self.stop_deadline is not None and now >= self.stop_deadline:
+                self.progress("agent did not settle after the abort")
+                return self.finish("timeout" if self.timing_out else "aborted", LAST_TEXT_TIMEOUT_S)
+            if now >= next_inbox:
+                self.check_inbox()
+                next_inbox = now + INBOX_POLL_S
+            if self.settled:
+                return self.finish(self.settled_status(), LAST_TEXT_TIMEOUT_S)
+            response = self.prompt_response
+            if response is not None and not response.get("success"):
+                return self.finish("failed", LAST_TEXT_TIMEOUT_S, response.get("error") or "prompt rejected")
+            if response is not None and (response.get("data") or {}).get("disposition") == "handled":
+                return self.finish("done", LAST_TEXT_TIMEOUT_S)
+            if self.eof:
+                return self.finish_eof()
+            wait = INBOX_POLL_S
+            for limit in (deadline, self.stop_deadline):
+                if limit is not None:
+                    wait = min(wait, limit - now)
+            self.pump(wait)
+
+    def settled_status(self):
+        if self.timing_out:
+            return "timeout"
+        if self.abort_requested or self.last_stop == "aborted":
+            return "aborted"
+        if self.last_stop == "error":
+            return "failed"
+        return "done"
+
+    def finish(self, status, text_timeout, error=None):
+        self.finishing = True
+        text = None
+        if not self.eof:
+            response = self.request({"type": "get_last_assistant_text"}, text_timeout)
+            if response and response.get("success"):
+                text = (response.get("data") or {}).get("text")
+        output = text or ""
+        if status == "failed":
+            detail = error or self.last_error
+            if detail:
+                output = (output + "\n\n" if output else "") + "error: " + detail
+        self.stop_pi()
+        return self.conclude(status, output)
+
+    def finish_eof(self):
+        self.finishing = True
+        self.stop_pi()
+        stderr = read_text(job_path(self.job_dir, "stderr.txt"), "") or ""
+        tail = "\n".join(stderr.rstrip("\n").splitlines()[-20:])
+        output = "pi exited before the run finished (exit status %s)." % self.proc.returncode
+        if tail:
+            output += " Last lines of its stderr:\n\n" + tail
+        return self.conclude("failed", output)
+
+    def finish_killed(self, reason):
+        self.finishing = True
+        write_atomic(job_path(self.job_dir, "killed"), "")
+        self.progress(reason)
+        text = None
+        if not self.eof:
+            response = self.request({"type": "get_last_assistant_text"}, SIGNAL_TEXT_TIMEOUT_S)
+            if response and response.get("success"):
+                text = (response.get("data") or {}).get("text")
+        self.stop_pi()
+        return self.conclude("killed", text or "")
+
+    def stop_pi(self):
+        """Close pi's stdin, which makes it shut down; escalate to SIGTERM and SIGKILL."""
+        self.close_stdin()
+        if self.proc is None:
+            return
+        for signum, grace in ((None, PI_EXIT_GRACE_S), (signal.SIGTERM, PI_TERM_GRACE_S), (signal.SIGKILL, 0)):
+            if self.proc.poll() is not None:
+                break
+            if signum is not None:
+                try:
+                    self.proc.send_signal(signum)
+                except OSError:
+                    pass
+            end = time.monotonic() + grace
+            while self.proc.poll() is None and time.monotonic() < end:
+                # Keep reading: pi stalls if its stdout pipe fills during shutdown.
+                self.pump(0.1)
+                self.check_inbox()
+        self.proc.wait()
+        self.check_inbox()
+
+    def conclude(self, status, output):
+        self.finishing = True
+        write_atomic(job_path(self.job_dir, "output.txt"), output + ("\n" if output else ""))
+        write_atomic(job_path(self.job_dir, "usage.json"), json.dumps(self.usage, indent=2) + "\n")
+        if self.model_used:
+            write_atomic(job_path(self.job_dir, "model"), self.model_used + "\n")
+        write_atomic(job_path(self.job_dir, "ended_at"), utcnow() + "\n")
+        write_atomic(job_path(self.job_dir, "status"), status + "\n")
+        code = EXIT_OK if status == "done" else EXIT_FAIL
+        write_atomic(job_path(self.job_dir, "exit_code"), "%d\n" % code)
+        self.progress("run %s ended: %s" % (read_int(job_path(self.job_dir, "runs")), status))
+        return status
+
+    def emergency_stop(self):
+        """Best-effort cleanup after an unexpected error in the runner."""
+        self.close_stdin()
+        if self.proc is not None and self.proc.poll() is None:
+            try:
+                self.proc.wait(PI_EXIT_GRACE_S)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+
+
+def format_seconds(value):
+    return ("%g" % value) if value is not None else "none"
+
+
+def run_runner(job_dir, caller_fd=None):
+    """Run one job run to completion and return its final status."""
+    runner = Runner(job_dir, caller_fd)
+    try:
+        return runner.run()
+    except Exception:
+        with open(job_path(job_dir, "runner.log"), "a", encoding="utf-8") as fh:
+            fh.write("%s\n%s\n" % (utcnow(), traceback.format_exc()))
+        runner.emergency_stop()
+        return runner.conclude("failed", "the runner failed; see %s" % job_path(job_dir, "runner.log"))
+
+
+# --- starting runs -----------------------------------------------------------
+
+
+def caller_depth():
+    try:
+        return int(os.environ.get("MULTI_AGENT_DEPTH") or 0)
+    except ValueError:
+        return 0
+
+
+def check_depth():
+    depth = caller_depth()
+    try:
+        limit = int(os.environ.get("MULTI_AGENT_MAX_DEPTH") or DEFAULT_MAX_DEPTH)
+    except ValueError:
+        limit = DEFAULT_MAX_DEPTH
+    if depth >= limit:
+        raise CommandError(
+            "cannot start an agent: this caller is at depth %d and MULTI_AGENT_MAX_DEPTH is %d"
+            % (depth, limit)
+        )
+    return depth + 1
+
+
+PREVIOUS_RUN_FILES = ("exit_code", "killed", "ended_at", "pi_pid", "runner_pid", "output.txt", "model")
+
+
+def start_run(job_dir, job, prompt, background, timeout, run_kind):
+    """Record a new run of the job and start its runner.
+
+    The runner is always a detached process. In the foreground this process
+    stays as the runner's caller: it waits for the runner, prints the result,
+    and holds the write end of the pipe whose end of file stops the run.
+    """
+    job["mode"] = "background" if background else "foreground"
+    job["timeout"] = timeout
+    job["run_kind"] = run_kind
+    write_atomic(job_path(job_dir, "job.json"), json.dumps(job, indent=2) + "\n")
+    write_atomic(job_path(job_dir, "prompt.txt"), prompt)
+    inbox = job_path(job_dir, "inbox")
+    shutil.rmtree(inbox, ignore_errors=True)
+    os.makedirs(inbox, exist_ok=True)
+    for name in PREVIOUS_RUN_FILES:
+        remove(job_path(job_dir, name))
+    runs = (read_int(job_path(job_dir, "runs")) or 0) + 1
+    write_atomic(job_path(job_dir, "runs"), "%d\n" % runs)
+    write_atomic(job_path(job_dir, "started_at"), utcnow() + "\n")
+    write_atomic(job_path(job_dir, "status"), "running\n")
+
+    argv = [sys.executable, SCRIPT_PATH, "__runner", job_dir]
+    caller_r = caller_w = None
+    if not background:
+        # os.pipe() descriptors are not inherited, so only the runner gets
+        # the read end and only this process holds the write end.
+        caller_r, caller_w = os.pipe()
+        argv.append(str(caller_r))
+    proc = subprocess.Popen(
+        argv,
+        cwd=job["cwd"],
+        # Its own session, so the caller's process group and terminal never
+        # signal it. The caller's end is the pipe above.
+        start_new_session=True,
+        # No handle on the caller's stdout or stderr, so a command that runs
+        # this script never waits for the runner.
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        pass_fds=(caller_r,) if caller_r is not None else (),
+    )
+    write_atomic(job_path(job_dir, "runner_pid"), "%d\n" % proc.pid)
+    if background:
+        sys.stdout.write("job: %s\nstatus: running\ntimeout_s: %s\n" % (job["name"], format_seconds(timeout)))
+        return EXIT_OK
+    os.close(caller_r)
+    note("started job %s" % job["name"])
+    return follow_runner(job_dir, proc, caller_w)
+
+
+def follow_runner(job_dir, proc, caller_w):
+    """Foreground: wait for the runner to end the run and print the result.
+
+    SIGTERM, SIGHUP or SIGINT closes caller_w, so the runner stops the run and
+    records it, and this process still prints the result. A second signal
+    ends this process at once. Any other end of this process, SIGKILL
+    included, also closes caller_w.
+    """
+    closed = []
+
+    def on_signal(_signum, _frame):
+        if not closed:
+            closed.append(True)
+            os.close(caller_w)
+        for signum in STOP_SIGNALS:
+            if signal.getsignal(signum) is not signal.SIG_IGN:
+                signal.signal(signum, signal.SIG_DFL)
+
+    for signum in STOP_SIGNALS:
+        if signal.getsignal(signum) is not signal.SIG_IGN:
+            signal.signal(signum, on_signal)
+    proc.wait()
+    return print_result(job_dir, job_status(job_dir))
+
+
+def cmd_runner(argv):
+    """Internal: the detached runner of a run. A foreground run passes the caller's pipe."""
+    job_dir = argv[0]
+    caller_fd = int(argv[1]) if len(argv) > 1 else None
+    run_runner(job_dir, caller_fd)
+    return EXIT_OK
+
+
+# --- argument parsing --------------------------------------------------------
+
+
+class Args:
+    """A small parser for `--opt value`, `--opt=value`, flags and positionals."""
+
+    def __init__(self, argv, with_value, flags):
+        self.values = {}
+        self.flags = set()
+        self.positional = []
+        i = 0
+        only_positional = False
+        while i < len(argv):
+            arg = argv[i]
+            if only_positional or arg == "-" or not arg.startswith("-"):
+                self.positional.append(arg)
+            elif arg == "--":
+                only_positional = True
+            elif arg in ("-h", "--help"):
+                self.flags.add("help")
+            else:
+                name, eq, value = arg.partition("=")
+                if name in with_value:
+                    if not eq:
+                        if i + 1 >= len(argv):
+                            raise usage_error("%s needs a value" % name)
+                        i += 1
+                        value = argv[i]
+                    self.values[name] = value
+                elif name in flags and not eq:
+                    self.flags.add(name)
+                else:
+                    raise usage_error("unknown option: %s" % arg)
+            i += 1
+
+
+def parse_seconds(value, option):
+    try:
+        seconds = float(value)
+    except ValueError:
+        raise usage_error("%s needs a number of seconds, got: %s" % (option, value))
+    if seconds < 0 or seconds != seconds:
+        raise usage_error("%s needs a number of seconds, got: %s" % (option, value))
+    return seconds
+
+
+def run_timeout(args, background):
+    if "--timeout" in args.values:
+        seconds = parse_seconds(args.values["--timeout"], "--timeout")
+        return seconds or None
+    return BACKGROUND_TIMEOUT_S if background else None
+
+
+def read_message(args, what):
+    if len(args.positional) != 1:
+        raise usage_error("expected one %s (a string, or - to read stdin)" % what)
+    text = args.positional[0]
+    if text == "-":
+        text = sys.stdin.read().rstrip("\n")
+    if not text.strip():
+        raise usage_error("empty %s" % what)
+    return text
+
+
+def one_name(args, command):
+    if len(args.positional) != 1:
+        raise usage_error("%s needs one job name" % command)
+    return args.positional[0]
+
+
+# --- commands ----------------------------------------------------------------
+
+
+def cmd_run(argv):
+    args = Args(
+        argv,
+        ("--profile", "--name", "--timeout", "--model", "--thinking", "--cwd"),
+        ("--background", "--fork"),
+    )
+    if "help" in args.flags:
+        sys.stdout.write(USAGE + "\n")
+        return EXIT_OK
+    background = "--background" in args.flags
+    timeout = run_timeout(args, background)
+    project = logical_cwd()
+    cwd = project
+    if "--cwd" in args.values:
+        cwd = os.path.normpath(os.path.join(project, os.path.expanduser(args.values["--cwd"])))
+        if not os.path.isdir(cwd):
+            raise usage_error("--cwd is not a directory: %s" % args.values["--cwd"])
+    prompt = read_message(args, "prompt")
+    fork = None
+    if "--fork" in args.flags:
+        fork = os.environ.get("PI_SESSION_FILE")
+        if not fork:
+            raise CommandError("--fork needs PI_SESSION_FILE, which is not set in this environment")
+        if not os.path.isfile(fork):
+            raise CommandError("--fork: PI_SESSION_FILE does not exist: %s" % fork)
+    depth = check_depth()
+    profile = find_profile(cwd, args.values.get("--profile") or DEFAULT_PROFILE)
+
+    root = jobs_dir(project)
+    os.makedirs(root, exist_ok=True)
+    name = args.values.get("--name")
+    if name is not None:
+        validate_name(name)
+        try:
+            os.mkdir(os.path.join(root, name))
+        except FileExistsError:
+            raise CommandError(
+                "job %s already exists in this project; use `resume %s` to continue it, pick"
+                " another --name, or `rm %s` first" % (name, name, name)
+            )
+    else:
+        for _attempt in range(100):
+            name = default_name(profile["name"])
+            try:
+                os.mkdir(os.path.join(root, name))
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise CommandError("could not find a free job name; pass --name")
+    job_dir = os.path.join(root, name)
+
+    try:
+        model = resolve_model(args.values.get("--model"), profile)
+        thinking = resolve_thinking(args.values.get("--thinking"), profile)
+        pi_args = profile_args(profile, model, thinking, job_path(job_dir, "system-prompt.md"))
+        write_atomic(job_path(job_dir, "append-prompt.md"), append_prompt(profile, name))
+        session_dir = sessions_dir(project)
+        os.makedirs(session_dir, exist_ok=True)
+        job = {
+            "name": name,
+            "profile": profile["name"],
+            "profile_source": profile["source"],
+            "cwd": cwd,
+            "project": project,
+            "session_dir": session_dir,
+            "parent": os.environ.get("MULTI_AGENT_JOB") or None,
+            "depth": depth,
+            "model": model,
+            "thinking": thinking,
+            "fork": fork,
+            "pi_args": pi_args,
+            "created_at": utcnow(),
+        }
+    except BaseException:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise
+    return start_run(job_dir, job, prompt, background, timeout, "new")
+
+
+def cmd_resume(argv):
+    args = Args(argv, ("--timeout",), ("--background",))
+    if len(args.positional) < 1:
+        raise usage_error("resume needs a job name and a prompt")
+    name = args.positional.pop(0)
+    background = "--background" in args.flags
+    timeout = run_timeout(args, background)
+    prompt = read_message(args, "prompt")
+    job_dir = find_job(name)
+    if job_status(job_dir) == "running":
+        raise CommandError("job %s is running; use steer, or wait for it to finish" % name)
+    check_depth()
+    job = read_json(job_path(job_dir, "job.json"))
+    if not job:
+        raise CommandError("job %s has no readable job.json" % name)
+    if not find_session_file(job["session_dir"], name):
+        note("no session file found for %s; the agent starts a new conversation" % name)
+    return start_run(job_dir, job, prompt, background, timeout, "resume")
+
+
+def cmd_wait(argv):
+    args = Args(argv, ("--timeout",), ())
+    job_dir = find_job(one_name(args, "wait"))
+    timeout = parse_seconds(args.values["--timeout"], "--timeout") if "--timeout" in args.values else None
+    end = None if timeout is None else time.monotonic() + timeout
+    while True:
+        status = job_status(job_dir)
+        if status != "running":
+            return print_result(job_dir, status)
+        if end is not None and time.monotonic() >= end:
+            lines = (read_text(job_path(job_dir, "progress.log"), "") or "").splitlines()
+            sys.stdout.write(
+                "job: %s\nstatus: running\nwaited_s: %s\n" % (os.path.basename(job_dir), format_seconds(timeout))
+            )
+            if lines:
+                sys.stdout.write("last_progress: %s\n" % lines[-1])
+            return EXIT_STILL_RUNNING
+        time.sleep(0.5 if end is None else max(0.0, min(0.5, end - time.monotonic())))
+
+
+def cmd_result(argv):
+    job_dir = find_job(one_name(Args(argv, (), ()), "result"))
+    status = job_status(job_dir)
+    if status == "running":
+        raise CommandError("job %s is still running; use wait" % os.path.basename(job_dir))
+    return print_result(job_dir, status)
+
+
+def send_control(job_dir, request):
+    if job_status(job_dir) != "running":
+        raise CommandError(NOT_RUNNING)
+    inbox = job_path(job_dir, "inbox")
+    os.makedirs(inbox, exist_ok=True)
+    base = "%d-%d" % (time.time() * 1000000, os.getpid())
+    request_path = os.path.join(inbox, base + ".json")
+    ack_path = os.path.join(inbox, base + ".ack")
+    write_atomic(request_path, json.dumps(request) + "\n")
+    end = time.monotonic() + ACK_TIMEOUT_S
+    while True:
+        reply = read_json(ack_path)
+        if reply is not None:
+            remove(ack_path)
+            break
+        if job_status(job_dir) != "running" and not os.path.exists(ack_path):
+            remove(request_path)
+            raise CommandError(NOT_RUNNING)
+        if time.monotonic() >= end:
+            remove(request_path)
+            raise CommandError("the runner did not acknowledge the request within %d seconds" % ACK_TIMEOUT_S)
+        time.sleep(0.1)
+    if not reply.get("ok"):
+        raise CommandError(reply.get("error") or "request failed")
+    return reply
+
+
+def cmd_steer(argv):
+    args = Args(argv, (), ())
+    if len(args.positional) < 1:
+        raise usage_error("steer needs a job name and a message")
+    name = args.positional.pop(0)
+    message = read_message(args, "message")
+    job_dir = find_job(name)
+    reply = send_control(job_dir, {"type": "steer", "message": message})
+    sys.stdout.write("job: %s\nsteer: %s\n" % (os.path.basename(job_dir), reply.get("disposition", "queued")))
+    return EXIT_OK
+
+
+def cmd_abort(argv):
+    job_dir = find_job(one_name(Args(argv, (), ()), "abort"))
+    reply = send_control(job_dir, {"type": "abort"})
+    sys.stdout.write("job: %s\nabort: %s\n" % (os.path.basename(job_dir), reply.get("disposition", "requested")))
+    return EXIT_OK
+
+
+def kill_job(job_dir):
+    """Stop one job by pid: the runner first, then pi if it outlives the runner."""
+    name = os.path.basename(job_dir)
+    status = job_status(job_dir)
+    if status != "running":
+        return "job: %s\nstatus: %s (not running)\n" % (name, status)
+    write_atomic(job_path(job_dir, "killed"), "")
+    runner = read_int(job_path(job_dir, "runner_pid"))
+    end = time.monotonic() + START_GRACE_S
+    while runner is None and time.monotonic() < end:
+        time.sleep(0.1)
+        runner = read_int(job_path(job_dir, "runner_pid"))
+    if runner is not None and process_alive(runner, b"multi_agent"):
+        try:
+            os.kill(runner, signal.SIGTERM)
+        except OSError:
+            pass
+        if not wait_for_exit(runner, b"multi_agent", KILL_GRACE_S):
+            try:
+                os.kill(runner, signal.SIGKILL)
+            except OSError:
+                pass
+            wait_for_exit(runner, b"multi_agent", 2)
+    pi_pid = read_int(job_path(job_dir, "pi_pid"))
+    if pi_pid is not None and not wait_for_exit(pi_pid, b"rpc", KILL_GRACE_S):
+        try:
+            os.kill(pi_pid, signal.SIGKILL)
+        except OSError:
+            pass
+    if not os.path.exists(job_path(job_dir, "exit_code")):
+        write_atomic(job_path(job_dir, "ended_at"), utcnow() + "\n")
+        write_atomic(job_path(job_dir, "status"), "killed\n")
+        write_atomic(job_path(job_dir, "exit_code"), "%d\n" % EXIT_FAIL)
+        append_progress(job_dir, "killed")
+    return "job: %s\nstatus: %s\n" % (name, job_status(job_dir))
+
+
+def project_jobs(project):
+    root = jobs_dir(project)
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return []
+    return [os.path.join(root, n) for n in names if os.path.isdir(os.path.join(root, n))]
+
+
+def cmd_kill(argv):
+    args = Args(argv, (), ("--all",))
+    if "--all" in args.flags:
+        if args.positional:
+            raise usage_error("kill takes a job name or --all, not both")
+        running = [d for d in project_jobs(logical_cwd()) if job_status(d) == "running"]
+        if not running:
+            sys.stdout.write("no running jobs in this project\n")
+            return EXIT_OK
+        results = {}
+
+        def kill_one(job_dir):
+            results[job_dir] = kill_job(job_dir)
+
+        threads = [threading.Thread(target=kill_one, args=(d,)) for d in running]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        sys.stdout.write("".join(results[d] for d in running))
+        return EXIT_OK
+    job_dir = find_job(one_name(args, "kill"))
+    sys.stdout.write(kill_job(job_dir))
+    return EXIT_OK
+
+
+def cmd_status(argv):
+    job_dir = find_job(one_name(Args(argv, (), ()), "status"))
+    job = read_json(job_path(job_dir, "job.json"), {})
+    status = job_status(job_dir)
+    name = os.path.basename(job_dir)
+    session_dir = job.get("session_dir", "")
+    sessions = find_session_file(session_dir, name)
+
+    def value(file_name):
+        return (read_text(job_path(job_dir, file_name), "") or "").strip() or "-"
+
+    lines = [
+        ("name", name),
+        ("status", status),
+        ("mode", job.get("mode", "-")),
+        ("profile", job.get("profile", "-")),
+        ("model", model_label(job_dir, job)),
+        ("parent", os.path.basename(job["parent"]) if job.get("parent") else "-"),
+        ("cwd", job.get("cwd", "-")),
+        ("started_at", value("started_at")),
+        ("ended_at", value("ended_at")),
+        ("runs", value("runs")),
+        ("exit_code", value("exit_code")),
+        ("output_file", job_path(job_dir, "output.txt")),
+        ("session_file", sessions[-1] if sessions else "-"),
+        (
+            "session_cmd",
+            "cd %s && pi --session-dir %s --session-id %s"
+            % (shlex.quote(job.get("cwd", ".")), shlex.quote(session_dir), shlex.quote(name)),
+        ),
+    ]
+    if status == "running":
+        lines.append(("note", "open the session in pi only after the job stops"))
+    sys.stdout.write("".join("%s: %s\n" % pair for pair in lines))
+    return EXIT_OK
+
+
+def cmd_peek(argv):
+    args = Args(argv, ("-n",), ())
+    count = args.values.get("-n", "20")
+    if not count.isdigit():
+        raise usage_error("-n needs a whole number of lines, got: %s" % count)
+    job_dir = find_job(one_name(args, "peek"))
+    lines = (read_text(job_path(job_dir, "progress.log"), "") or "").splitlines()
+    tail = lines[-int(count) :] if int(count) else []
+    sys.stdout.write("".join(line + "\n" for line in tail))
+    return EXIT_OK
+
+
+def cmd_list(argv):
+    args = Args(argv, (), ("--all",))
+    if args.positional:
+        raise usage_error("list takes no job name")
+    rows = []
+    now = time.time()
+    for job_dir in project_jobs(logical_cwd()):
+        job = read_json(job_path(job_dir, "job.json"), {})
+        status = job_status(job_dir)
+        started = parse_utc(read_text(job_path(job_dir, "started_at"), "") or "")
+        ended = parse_utc(read_text(job_path(job_dir, "ended_at"), "") or "")
+        since = started if status == "running" else (ended or started)
+        if "--all" not in args.flags and status != "running" and (since is None or now - since > RECENT_S):
+            continue
+        rows.append(
+            (
+                started or 0,
+                os.path.basename(job_dir),
+                status,
+                job.get("mode", "-"),
+                os.path.basename(job["parent"]) if job.get("parent") else "-",
+                format_age(now - since) if since is not None else "-",
+            )
+        )
+    if not rows:
+        sys.stdout.write("no jobs in this project\n")
+        return EXIT_OK
+    rows.sort()
+    table = [("NAME", "STATUS", "MODE", "PARENT", "AGE")] + [row[1:] for row in rows]
+    widths = [max(len(row[i]) for row in table) for i in range(4)]
+    for row in table:
+        cells = [row[i].ljust(widths[i]) for i in range(4)] + [row[4]]
+        sys.stdout.write("  ".join(cells) + "\n")
+    return EXIT_OK
+
+
+def cmd_profiles(argv):
+    args = Args(argv, (), ())
+    if args.positional:
+        raise usage_error("profiles takes no arguments")
+    profiles = sorted(
+        (p for p in load_profiles(logical_cwd()).values() if p["enabled"]), key=lambda p: p["name"].lower()
+    )
+    for profile in profiles:
+        sys.stdout.write(
+            "%s\n  description: %s\n  source: %s\n"
+            % (profile["name"], " ".join(profile["description"].split()), profile["source"])
+        )
+    if not profiles:
+        sys.stdout.write("no profiles found\n")
+    return EXIT_OK
+
+
+def cmd_rm(argv):
+    job_dir = find_job(one_name(Args(argv, (), ()), "rm"))
+    name = os.path.basename(job_dir)
+    if job_status(job_dir) == "running":
+        raise CommandError("job %s is running; kill it first" % name)
+    job = read_json(job_path(job_dir, "job.json"), {})
+    for path in find_session_file(job.get("session_dir", ""), name):
+        remove(path)
+    shutil.rmtree(job_dir, ignore_errors=True)
+    sys.stdout.write("removed: %s\n" % name)
+    return EXIT_OK
+
+
+COMMANDS = {
+    "run": cmd_run,
+    "resume": cmd_resume,
+    "wait": cmd_wait,
+    "result": cmd_result,
+    "steer": cmd_steer,
+    "abort": cmd_abort,
+    "kill": cmd_kill,
+    "status": cmd_status,
+    "peek": cmd_peek,
+    "list": cmd_list,
+    "profiles": cmd_profiles,
+    "rm": cmd_rm,
+}
+
+
+def main(argv):
+    if sys.platform == "win32":
+        note("Windows is not supported")
+        return EXIT_FAIL
+    if not argv:
+        sys.stderr.write(USAGE + "\n")
+        return EXIT_USAGE
+    command, rest = argv[0], argv[1:]
+    if command in ("-h", "--help", "help"):
+        sys.stdout.write(USAGE + "\n")
+        return EXIT_OK
+    if command == "__runner":
+        return cmd_runner(rest)
+    handler = COMMANDS.get(command)
+    if handler is None:
+        note("unknown command: %s (try --help)" % command)
+        return EXIT_USAGE
+    try:
+        return handler(rest)
+    except CommandError as exc:
+        note("error: %s" % exc)
+        return exc.code
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except BrokenPipeError:
+        sys.exit(EXIT_FAIL)
+    except KeyboardInterrupt:
+        sys.exit(130)

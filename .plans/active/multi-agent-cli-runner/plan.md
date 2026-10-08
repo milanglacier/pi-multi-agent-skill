@@ -1,0 +1,203 @@
+# Plan: implement the multi-agent skill and CLI runner
+
+The design is in `spec.md` in this directory. This plan covers the order of
+work, what each step produces, and how each step is verified.
+
+Draft; not yet approved.
+
+## Scope
+
+- Everything under `pi-multi-agent-skill/`: the script, SKILL.md, reference.md,
+  the two built-in profiles, README.md, LICENSE and the tests.
+- No changes to other submodules. pi-minimal-permission-system and
+  pi-background-tasks already have what the spec relies on.
+- `pi-multi-agent-skill/` stays a plain directory in the monorepo. Turning it
+  into a submodule, pushing, and replacing pi-subagents in the user's setup
+  are separate steps after this plan.
+- Nothing is committed unless the user asks.
+
+## Step 1: spike the risky assumptions with real pi
+
+These checks decide parts of the design, so they run before the script is
+written. Each one uses a throwaway Python snippet that starts
+`pi --mode rpc` and speaks the protocol directly.
+
+1. **pi follows its runner** (spec check 7). Start pi in its own session
+   with piped stdin and stdout, prompt it to run `sleep 600` with `bash` and
+   to start a `bg_task` task, then SIGKILL the parent snippet. Verify that pi
+   exits, that the `sleep` process tree is gone, and that the task is
+   stopped. If pi exits on EPIPE before shutdown completes, write the
+   stdout-guard extension (a few lines that add an error handler to
+   `process.stdout`), load it with `-e`, and repeat.
+2. **Resume by name** (spec check 3). Start with `--session-dir D
+   --session-id N`, end the run, then start with `--session-dir D --session
+   N` and confirm that the conversation continues.
+3. **Dialog answer** (spec check 4). Configure an `ask` rule, run with
+   `PI_MINIMAL_PERMISSION_SYSTEM_NONINTERACTIVE=1`, and confirm that no
+   `extension_ui_request` arrives and the tool result carries the no-UI
+   reason. Repeat without the variable and answer with `cancelled: true` to
+   confirm that the agent continues.
+
+Record the results in a `progress.md` next to this plan. If a result
+contradicts the spec, update the spec before going on.
+
+## Step 2: scaffolding
+
+- Create the layout from spec "Repository and layout".
+- README.md: what the skill is, how to install it with the symlink, the
+  credit to pi-subagents for the `Explore` prompt.
+- LICENSE: MIT, as in the other projects.
+- `tests/fake-pi`: a Python script that implements the subset of the RPC
+  protocol the runner uses (`prompt`, `steer`, `abort`,
+  `get_last_assistant_text`, the events in spec "Protocol handling") and the
+  test controls listed in spec "Tests". Write it before the runner, so each
+  later step can be tested as it is built.
+
+## Step 3: profiles
+
+In `multi_agent.py`:
+
+- Frontmatter parser with the subset in spec "Fields".
+- Discovery across the three directories, whole-file replacement and
+  `enabled: false`.
+- Conversion of a profile plus `run` options into pi arguments, including
+  model and thinking precedence.
+- The `profiles` command.
+
+Write `profiles/general-purpose.md` and `profiles/Explore.md`. Take the
+`Explore` prompt from pi-subagents `src/default-agents.ts`.
+
+Tests: discovery, replacement, parsing, argument building, precedence.
+
+## Step 4: job state
+
+- Project slug and logical cwd, job and session directories.
+- Name validation and default names.
+- Atomic writes for every state file.
+- Reading a job's state, including the `died` check.
+- `status`, `peek`, `list`, `result` and `rm`, which only read or delete
+  state.
+
+Tests: name rules, slug, `died` detection, the read-only commands on
+hand-made job directories.
+
+## Step 5: the runner
+
+- Start pi with the arguments from step 3, in its own session, with the
+  child environment from spec "Starting pi".
+- Event loop over pi's stdout, splitting records on `\n` only, with a timer
+  for the inbox and the timeout.
+- Record handling from spec "Protocol handling", including dialog answers.
+- Finishing a run, timeout, and signal handling as specified.
+- The control inbox on the runner side.
+
+Tests: the runner against fake-pi for each record type, dialog answers,
+timeout, each signal, early end of pi's stdout, U+2028 in records, and
+SIGKILL to the runner with fake-pi reporting that its stdin closed.
+
+## Step 6: commands
+
+- `run` in the foreground and with `--background`, `resume`, and `--fork`.
+- `wait` and the result format and exit codes.
+- `steer` and `abort` on the command side of the inbox.
+- `kill NAME` and `kill --all`.
+- The depth limit.
+
+Tests: the remaining items in spec "Tests", including a background job that
+survives its caller's exit.
+
+## Step 7: SKILL.md and reference.md
+
+- SKILL.md as listed in spec "SKILL.md contents". Keep it short; it is read
+  on every use.
+- reference.md with the full option tables, status meanings, the state
+  layout and troubleshooting.
+- Check that neither file names a particular extension or harness tool, or
+  mentions permission modes.
+
+## Step 8: real-pi verification
+
+- Symlink `skills/multi-agent` to `~/.pi/agent/skills/multi-agent`.
+- Run spec checks 1, 2, 5 and 6, and repeat check 7 through the finished
+  script.
+- In an interactive pi session, have the agent use the skill for a parallel
+  `Explore` task through `bg_task`, steer one job, and resume a finished one.
+- Record results in `progress.md` and update the spec where real behavior
+  differs.
+
+## Done when
+
+- `python3 -m unittest discover tests` passes with Python 3.9 and the
+  current Python.
+- All seven real-pi checks pass or have a recorded, accepted outcome.
+- The interactive session in step 8 works without manual cleanup of
+  processes or state.
+
+## Revision after step 8: foreground command, no agent extension
+
+Steps 1-8 shipped with `scripts/agent-extension.ts`, an extension the runner
+loaded into every agent with `-e`. It did two things, and both are replaced.
+
+### Why
+
+1. **APPEND_SYSTEM.md.** `--append-system-prompt` makes pi skip the
+   `APPEND_SYSTEM.md` it would otherwise load (real-pi check 1), so the
+   extension added the job's prompt text itself. Decision: pass
+   `--append-system-prompt` and accept that agents do not get
+   `APPEND_SYSTEM.md`. The file is rarely used; the alternatives were the
+   extension, or copying pi's lookup of the file into the script, which
+   would break quietly when pi changes it.
+2. **Clean shutdown after the runner dies.** The foreground `run` process was
+   the runner. A `bash` tool abort sends SIGKILL to the command's process
+   group, so the runner died, pi saw its stdin close while nothing read its
+   stdout, and pi 1.1.0 exited on the first EPIPE before its shutdown ran.
+   The agent's `bash` command and `bg_task` tasks survived. In a nested chain
+   (main pi → A → B) the survivor was B's runner, so agent B kept working,
+   spending tokens and changing files, with nobody reading its result. The
+   extension fixed this by deferring pi's `process.exit(1)` until dispose,
+   which replaces `process.exit` and depends on pi internals.
+
+### Options weighed for 2
+
+- Keep the extension: works, but fragile across pi updates.
+- Write pi's stdout to a file the runner tails: no EPIPE, but polling,
+  partial lines and a growing file. Not tried.
+- Background runs only: no crash, but only because nothing stops the job.
+  Esc and the end of the caller's session would no longer stop agents,
+  `kill` would not reach the jobs a job started, and every job would need a
+  `run` plus `wait` calls.
+- **Chosen: foreground command plus detached runner.** Every runner is
+  detached. A foreground `run`/`resume` starts it, keeps the only write end of
+  a pipe whose read end the runner watches, waits for it and prints the
+  result. When the foreground command ends, SIGKILL included, the runner
+  reads end of file and stops pi through its stdin while it keeps reading
+  pi's stdout, so pi's shutdown completes. Nested foreground runs stop level
+  by level.
+
+Trade-offs accepted: two processes per foreground run, and SIGKILL to the
+runner itself (`kill -9`, OOM killer) still leaves the agent's commands
+running, with status `died`. No harness path sends SIGKILL to the runner.
+
+### Steps
+
+1. Spec: "Foreground and background runs", "Concepts", "Starting pi",
+   "Signals and the end of the foreground command", "Lifetime" (with the
+   reasoning above), the job directory table, tests and check 7.
+2. Script: always start a detached runner; the foreground command passes the
+   pipe's read end (`__runner JOB_DIR FD`), forwards SIGTERM/SIGHUP/SIGINT by
+   closing its write end and prints the result; the runner treats end of file
+   on that pipe like a stop signal. Pass `--append-system-prompt`; delete
+   `scripts/agent-extension.ts`.
+3. fake-pi: `FAKE_PI_RUN` runs a command as a tool call in its own process
+   group and kills that group when stdin closes, as pi's shutdown does.
+4. Tests: runner detached from the foreground command, SIGKILL to the
+   foreground command's group, two nested foreground runs, `kill` on a
+   foreground run, the new pi arguments.
+5. reference.md: lifetime, `killed` and `died`, `APPEND_SYSTEM.md`.
+6. Real-pi checks: the system prompt of each profile; SIGKILL to the
+   foreground command's group; RPC abort of a caller pi's `bash` call; a
+   nested chain of two foreground runs; SIGKILL to the runner itself, to
+   confirm the accepted gap. Record results in `progress.md`.
+
+Done when the suite passes on Python 3.9 and the current Python, and the
+real-pi checks show no process left after each path except the accepted one.

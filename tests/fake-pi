@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+"""Offline stand-in for `pi --mode rpc`, used by test_multi_agent.py.
+
+It implements the part of the RPC protocol that multi_agent.py uses. Each test
+sets its behavior through environment variables:
+
+FAKE_PI_RECORD_DIR      Directory for start.jsonl, dialog.jsonl and exit.jsonl.
+FAKE_PI_REPLY           Final assistant text. Default: "reply to: <prompt> (turn N)".
+FAKE_PI_DELAY           Seconds the run takes before it settles. Default 0.
+FAKE_PI_STOP_REASON     stopReason of the final message. Default "stop".
+FAKE_PI_ERROR_MESSAGE   errorMessage of the final message.
+FAKE_PI_TOOL            Emit a tool_execution_start for `bash` with this command.
+FAKE_PI_DIALOG          Emit a dialog request with this method and wait for the answer.
+FAKE_PI_REJECT_PROMPT   Answer the prompt with success: false.
+FAKE_PI_HANDLED         Answer the prompt with disposition "handled" and start no run.
+FAKE_PI_EXIT_EARLY      Write to stderr and exit with status 3 after accepting the prompt.
+FAKE_PI_IGNORE_SIGTERM  Ignore SIGTERM.
+FAKE_PI_IGNORE_EOF      Keep running after stdin closes.
+FAKE_PI_RUN             Shell command to run like a `bash` tool call: in its own
+                        process group, which gets SIGKILL when stdin closes, as
+                        pi's shutdown does. The run settles when it exits.
+
+With --session-dir and --session-id it keeps a session file named like pi's,
+`<timestamp>_<id>.jsonl`, with one line per prompt, so a resumed job sees its
+earlier turns. --fork copies the given file into the new session.
+"""
+
+import json
+import os
+import queue
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+ENV = os.environ.get
+RECORD_DIR = ENV("FAKE_PI_RECORD_DIR")
+RECORDED_ENV_PREFIXES = ("MULTI_AGENT_", "PI_MINIMAL_PERMISSION_SYSTEM_", "HERDR_", "PWD")
+DIALOG_METHODS = ("select", "confirm", "input", "editor")
+
+
+def record(name, value):
+    if not RECORD_DIR:
+        return
+    value = dict(value, pid=os.getpid())
+    with open(os.path.join(RECORD_DIR, name + ".jsonl"), "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(value) + "\n")
+
+
+TOOL_PROCS = []
+
+
+def leave(reason, code=0):
+    if reason == "stdin_closed":
+        for proc in TOOL_PROCS:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+    record("exit", {"reason": reason})
+    os._exit(code)
+
+
+def emit(obj):
+    try:
+        sys.stdout.buffer.write(json.dumps(obj, ensure_ascii=False).encode("utf-8") + b"\n")
+        sys.stdout.buffer.flush()
+    except OSError:
+        pass
+
+
+def respond(cmd, success=True, data=None, error=None):
+    rec = {"type": "response", "command": cmd.get("type"), "success": success}
+    if cmd.get("id") is not None:
+        rec["id"] = cmd["id"]
+    if data is not None:
+        rec["data"] = data
+    if error is not None:
+        rec["error"] = error
+    emit(rec)
+
+
+def option(argv, name):
+    for i, arg in enumerate(argv):
+        if arg == name and i + 1 < len(argv):
+            return argv[i + 1]
+    return None
+
+
+class Session:
+    def __init__(self, argv):
+        self.path = None
+        directory = option(argv, "--session-dir")
+        sid = option(argv, "--session-id")
+        if not (directory and sid):
+            return
+        os.makedirs(directory, exist_ok=True)
+        pattern = re.compile(r"^[^_]+_" + re.escape(sid) + r"\.jsonl$")
+        for name in os.listdir(directory):
+            if pattern.match(name):
+                self.path = os.path.join(directory, name)
+                return
+        self.path = os.path.join(directory, "%s_%s.jsonl" % (time.strftime("%Y-%m-%dT%H-%M-%S-000Z"), sid))
+        fork = option(argv, "--fork")
+        with open(self.path, "w", encoding="utf-8") as handle:
+            if fork:
+                with open(fork, encoding="utf-8") as source:
+                    handle.write(source.read())
+
+    def add_turn(self, prompt):
+        if not self.path:
+            return 1
+        with open(self.path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"prompt": prompt}) + "\n")
+        with open(self.path, encoding="utf-8") as handle:
+            return sum(1 for _ in handle)
+
+
+def read_stdin(commands):
+    for line in sys.stdin.buffer:
+        line = line.strip()
+        if line:
+            try:
+                commands.put(json.loads(line.decode("utf-8")))
+            except ValueError:
+                emit({"type": "response", "command": "parse", "success": False, "error": "bad json"})
+    commands.put(None)
+
+
+def main():
+    argv = sys.argv[1:]
+    if ENV("FAKE_PI_IGNORE_SIGTERM") == "1":
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    else:
+        signal.signal(signal.SIGTERM, lambda _s, _f: leave("sigterm"))
+
+    record(
+        "start",
+        {
+            "argv": argv,
+            "env": {k: v for k, v in os.environ.items() if k.startswith(RECORDED_ENV_PREFIXES)},
+            "pgid": os.getpgid(0),
+            "sid": os.getsid(0),
+            "cwd": os.getcwd(),
+        },
+    )
+    session = Session(argv)
+    model = option(argv, "--model") or "fake/fake-model"
+    provider, _, model_id = model.partition("/")
+
+    commands = queue.Queue()
+    threading.Thread(target=read_stdin, args=(commands,), daemon=True).start()
+    # Fire-and-forget UI records that real pi sends at start-up.
+    emit({"type": "extension_ui_request", "id": "w1", "method": "setWidget", "widgetKey": "x"})
+
+    state = {"last_text": None}
+
+    def next_command(timeout=None):
+        try:
+            cmd = commands.get(timeout=timeout)
+        except queue.Empty:
+            return "timeout"
+        if cmd is None:
+            if ENV("FAKE_PI_IGNORE_EOF") == "1":
+                record("exit", {"reason": "stdin_closed_ignored"})
+                while True:
+                    time.sleep(3600)
+            leave("stdin_closed")
+        return cmd
+
+    def handle_idle(cmd):
+        kind = cmd.get("type")
+        if kind == "get_last_assistant_text":
+            respond(cmd, data={"text": state["last_text"]})
+        elif kind in ("clear_queue",):
+            respond(cmd, data={"steering": [], "followUp": []})
+        elif kind == "abort":
+            respond(cmd)
+        elif kind == "steer":
+            respond(cmd, success=False, error="Agent is not running")
+        elif kind == "extension_ui_response":
+            pass
+        else:
+            respond(cmd, success=False, error="Unknown command: %s" % kind)
+
+    def run_prompt(cmd):
+        prompt = cmd.get("message", "")
+        if ENV("FAKE_PI_REJECT_PROMPT") == "1":
+            respond(cmd, success=False, error="fake rejection")
+            return
+        if ENV("FAKE_PI_HANDLED") == "1":
+            respond(cmd, data={"disposition": "handled"})
+            return
+        respond(cmd, data={"disposition": "started"})
+        if ENV("FAKE_PI_EXIT_EARLY") == "1":
+            sys.stderr.write("fake-pi: line one\nfake-pi: crashed on purpose\n")
+            sys.stderr.flush()
+            leave("exit_early", 3)
+        turn = session.add_turn(prompt)
+        emit({"type": "agent_start"})
+        if ENV("FAKE_PI_TOOL"):
+            emit(
+                {
+                    "type": "tool_execution_start",
+                    "toolCallId": "call-1",
+                    "toolName": "bash",
+                    "args": {"command": ENV("FAKE_PI_TOOL")},
+                }
+            )
+        if ENV("FAKE_PI_DIALOG"):
+            emit(
+                {
+                    "type": "extension_ui_request",
+                    "id": "dialog-1",
+                    "method": ENV("FAKE_PI_DIALOG"),
+                    "title": "Fake dialog",
+                }
+            )
+            while True:
+                reply = next_command()
+                if reply.get("type") == "extension_ui_response" and reply.get("id") == "dialog-1":
+                    record("dialog", {"response": reply})
+                    break
+                handle_idle(reply)
+
+        tool = None
+        if ENV("FAKE_PI_RUN"):
+            tool = subprocess.Popen(["/bin/sh", "-c", ENV("FAKE_PI_RUN")], start_new_session=True)
+            TOOL_PROCS.append(tool)
+            record("tool", {"tool_pid": tool.pid})
+
+        steers = []
+        abort_cmd = None
+        deadline = time.monotonic() + float(ENV("FAKE_PI_DELAY") or 0)
+        while time.monotonic() < deadline or (tool is not None and tool.poll() is None):
+            wait = deadline - time.monotonic() if tool is None else 0.1
+            reply = next_command(timeout=max(0.01, wait))
+            if reply == "timeout":
+                if tool is None:
+                    break
+                continue
+            kind = reply.get("type")
+            if kind == "steer":
+                steers.append(reply.get("message", ""))
+                respond(reply, data={"disposition": "queued"})
+            elif kind == "abort":
+                abort_cmd = reply
+                break
+            else:
+                handle_idle(reply)
+
+        text = ENV("FAKE_PI_REPLY")
+        if text is None:
+            text = "reply to: %s (turn %d)" % (prompt, turn)
+        if steers:
+            text += " | steered: " + "; ".join(steers)
+        stop_reason = "aborted" if abort_cmd else (ENV("FAKE_PI_STOP_REASON") or "stop")
+        message = {
+            "role": "assistant",
+            "content": [{"type": "text", "text": text}],
+            "provider": provider,
+            "model": model_id,
+            "stopReason": stop_reason,
+            "usage": {
+                "input": 10,
+                "output": 5,
+                "cacheRead": 2,
+                "cacheWrite": 1,
+                "totalTokens": 18,
+                "cost": {"total": 0.001},
+            },
+        }
+        if ENV("FAKE_PI_ERROR_MESSAGE"):
+            message["errorMessage"] = ENV("FAKE_PI_ERROR_MESSAGE")
+        state["last_text"] = text
+        emit({"type": "message_end", "message": message})
+        emit({"type": "agent_end", "messages": [message], "willRetry": False})
+        emit({"type": "agent_settled", "aborted": bool(abort_cmd)})
+        if abort_cmd:
+            respond(abort_cmd)
+
+    while True:
+        cmd = next_command()
+        if cmd.get("type") == "prompt":
+            run_prompt(cmd)
+        else:
+            handle_idle(cmd)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,119 @@
+---
+name: multi-agent
+description: Start other pi agents as separate processes to work on tasks in parallel or in the background, then wait for, steer, stop, or resume them. Use it for independent research, broad codebase searches, and parallel work whose intermediate output should stay out of your context. Do not use it for small tasks you can do directly.
+---
+
+# Multi-agent
+
+This skill starts other agents and manages each one as a named job. An agent
+does not see your conversation, and you see only its final message.
+
+`SKILL_DIR` below is the directory that contains this SKILL.md. Every command
+has the form:
+
+```bash
+python3 "$SKILL_DIR/scripts/multi_agent.py" <command> ...
+```
+
+## When to delegate
+
+Delegate a task when it is independent of the rest of your work and its
+intermediate steps would only fill your context: researching a question,
+searching a large codebase, or several pieces of work that can run in
+parallel. Do small tasks yourself; starting an agent costs time and tokens.
+
+## Pick a profile
+
+A profile sets an agent's system prompt, model, thinking level and tools. Run
+this once per session to see the available profiles:
+
+```bash
+python3 "$SKILL_DIR/scripts/multi_agent.py" profiles
+```
+
+`general-purpose` (the default) has your tools and settings. `Explore` is a
+read-only search agent. Pass the profile with `--profile NAME`.
+
+## Run an agent
+
+For a short single task, run it in the foreground. The command blocks until
+the agent finishes and prints its result:
+
+```bash
+python3 "$SKILL_DIR/scripts/multi_agent.py" run --profile Explore "Where is the retry policy for HTTP calls defined?"
+```
+
+Pass a prompt longer than one line through `-` and a heredoc:
+
+```bash
+python3 "$SKILL_DIR/scripts/multi_agent.py" run --name auth-review - <<'EOF'
+Read src/auth/ and list every place that ...
+EOF
+```
+
+Write prompts that are self-contained: give the goal, the relevant paths and
+what the answer should contain. Add `--fork` only when the agent needs your
+conversation so far.
+
+For a long task, or several tasks in parallel:
+
+- If your harness has a tool that runs a shell command in the background, run
+  the foreground `run` command with it. The job then stops when your session
+  ends. The command prints `multi-agent: started job NAME` first; use that
+  name for `steer` and `abort`. If the tool can wake you on each output line,
+  turn that off and wait for the command to exit. If the tool has its own
+  timeout, disable it or make it longer than the job's `--timeout`.
+- Otherwise, or when the work must continue after your session ends, add
+  `--background`. The command prints the job name and returns at once. A
+  background job runs until it finishes or reaches its timeout (one hour by
+  default). Tell the user the job's name.
+- Never put the command in the background with `&`; use `--background`.
+
+Keep at most 4 jobs running at once unless the user asks for more.
+
+## Wait for a result
+
+```bash
+python3 "$SKILL_DIR/scripts/multi_agent.py" wait NAME --timeout 120
+```
+
+Exit code 2 means the job is still running; run the same command again in a
+new tool call. Wait for one job per tool call and do not chain several `wait`
+commands in one call: a message that steers you arrives only after your
+current tool call returns.
+
+The output is the agent's final message followed by a `--- multi-agent ---`
+footer. The footer is for you. Report the agent's findings to the user in your
+own words.
+
+Exit code 0 means the job ended with status `done`; 1 means it ended another
+way (`failed`, `aborted`, `timeout`, `killed`, `died`), and the output says
+why.
+
+## Correct or continue a job
+
+```bash
+python3 "$SKILL_DIR/scripts/multi_agent.py" steer NAME "Skip the tests directory"
+python3 "$SKILL_DIR/scripts/multi_agent.py" abort NAME
+python3 "$SKILL_DIR/scripts/multi_agent.py" kill NAME
+python3 "$SKILL_DIR/scripts/multi_agent.py" resume NAME "Now check the callers too"
+```
+
+- `steer` adds a message that the agent reads before its next step.
+- `abort` stops the agent and keeps its last message as the result.
+- `kill` stops a job that does not respond to `abort`.
+- `resume` continues a finished job's conversation with a new prompt.
+
+`kill --all` stops every running job of the current project. Use it only when
+the user asks.
+
+## Inspect jobs
+
+```bash
+python3 "$SKILL_DIR/scripts/multi_agent.py" list
+python3 "$SKILL_DIR/scripts/multi_agent.py" status NAME
+python3 "$SKILL_DIR/scripts/multi_agent.py" peek NAME
+```
+
+`peek` shows the job's recent tool calls. For every option, the status values,
+where state is kept and troubleshooting, see `reference.md` in this directory.
