@@ -16,13 +16,19 @@ FAKE_PI_HANDLED         Answer the prompt with disposition "handled" and start n
 FAKE_PI_EXIT_EARLY      Write to stderr and exit with status 3 after accepting the prompt.
 FAKE_PI_IGNORE_SIGTERM  Ignore SIGTERM.
 FAKE_PI_IGNORE_EOF      Keep running after stdin closes.
+FAKE_PI_IGNORE_ABORT    Keep running after an abort and never answer it.
+FAKE_PI_SLOW_EXIT       Seconds a shutdown takes after stdin closes, writing one
+                        event per second. A failed write exits with status 1
+                        and exit reason "epipe", as pi 1.1.0 does.
 FAKE_PI_RUN             Shell command to run like a `bash` tool call: in its own
                         process group, which gets SIGKILL when stdin closes, as
                         pi's shutdown does. The run settles when it exits.
 
 With --session-dir and --session-id it keeps a session file named like pi's,
-`<timestamp>_<id>.jsonl`, with one line per prompt, so a resumed job sees its
-earlier turns. --fork copies the given file into the new session.
+`<timestamp>_<id>.jsonl`, with one line per prompt and one per reply, so a
+resumed job sees its earlier turns. --fork copies the given file into the new
+session. As in pi, get_last_assistant_text returns the session's last reply,
+which may come from an earlier run or from the forked conversation.
 """
 
 import json
@@ -53,7 +59,16 @@ TOOL_PROCS = []
 
 
 def leave(reason, code=0):
-    if reason == "stdin_closed":
+    if reason == "stdin_closed" and ENV("FAKE_PI_SLOW_EXIT"):
+        for _ in range(int(ENV("FAKE_PI_SLOW_EXIT"))):
+            try:
+                sys.stdout.buffer.write(b'{"type":"shutdown_step"}\n')
+                sys.stdout.buffer.flush()
+            except OSError:
+                reason, code = "epipe", 1
+                break
+            time.sleep(1)
+    if reason in ("stdin_closed", "epipe"):
         for proc in TOOL_PROCS:
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
@@ -109,13 +124,24 @@ class Session:
                 with open(fork, encoding="utf-8") as source:
                     handle.write(source.read())
 
-    def add_turn(self, prompt):
+    def lines(self):
         if not self.path:
-            return 1
-        with open(self.path, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps({"prompt": prompt}) + "\n")
+            return []
         with open(self.path, encoding="utf-8") as handle:
-            return sum(1 for _ in handle)
+            return [json.loads(line) for line in handle if line.strip()]
+
+    def add(self, entry):
+        if self.path:
+            with open(self.path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(entry) + "\n")
+
+    def add_turn(self, prompt):
+        self.add({"prompt": prompt})
+        return max(1, sum(1 for line in self.lines() if "prompt" in line))
+
+    def last_reply(self):
+        replies = [line["reply"] for line in self.lines() if "reply" in line]
+        return replies[-1] if replies else None
 
 
 def read_stdin(commands):
@@ -155,7 +181,7 @@ def main():
     # Fire-and-forget UI records that real pi sends at start-up.
     emit({"type": "extension_ui_request", "id": "w1", "method": "setWidget", "widgetKey": "x"})
 
-    state = {"last_text": None}
+    state = {"last_text": session.last_reply()}
 
     def next_command(timeout=None):
         try:
@@ -246,6 +272,8 @@ def main():
                 steers.append(reply.get("message", ""))
                 respond(reply, data={"disposition": "queued"})
             elif kind == "abort":
+                if ENV("FAKE_PI_IGNORE_ABORT") == "1":
+                    continue
                 abort_cmd = reply
                 break
             else:
@@ -275,6 +303,7 @@ def main():
         if ENV("FAKE_PI_ERROR_MESSAGE"):
             message["errorMessage"] = ENV("FAKE_PI_ERROR_MESSAGE")
         state["last_text"] = text
+        session.add({"reply": text})
         emit({"type": "message_end", "message": message})
         emit({"type": "agent_end", "messages": [message], "willRetry": False})
         emit({"type": "agent_settled", "aborted": bool(abort_cmd)})

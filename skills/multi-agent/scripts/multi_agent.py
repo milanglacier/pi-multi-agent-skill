@@ -9,6 +9,7 @@
 # relying on the exec bit.
 
 import calendar
+import fcntl
 import json
 import os
 import re
@@ -48,15 +49,20 @@ BACKGROUND_TIMEOUT_S = 3600
 DEFAULT_MAX_DEPTH = 2
 INBOX_POLL_S = 0.5
 ACK_TIMEOUT_S = 10
-LAST_TEXT_TIMEOUT_S = 10
-SIGNAL_TEXT_TIMEOUT_S = 2
 SETTLE_TIMEOUT_S = 30
 PI_EXIT_GRACE_S = 10
 PI_TERM_GRACE_S = 5
-KILL_GRACE_S = 10
-# A run writes `status` before it starts the runner and records the
-# runner's pid right after. A job without a pid counts as running this long.
+# `kill` gives the runner its whole stop sequence for pi, plus a margin,
+# before it sends SIGKILL; a runner killed earlier would leave pi without a
+# reader during its shutdown.
+RUNNER_STOP_GRACE_S = PI_EXIT_GRACE_S + PI_TERM_GRACE_S + 5
+PI_KILL_GRACE_S = 10
+# A run takes the job's lock before it starts the runner and records the
+# runner's pid right after. `kill` waits this long for the pid.
 START_GRACE_S = 10
+# job_running() holds the lock for a moment while it tests it, so a run that
+# finds the lock taken tries again for this long.
+LOCK_RETRY_S = 1
 RECENT_S = 24 * 3600
 
 EXIT_OK = 0
@@ -177,11 +183,35 @@ def remove(path):
         pass
 
 
+def process_info(pid):
+    """(state letter, command line) of pid from /proc, or from ps where there is no /proc; None if unknown."""
+    if os.path.isdir("/proc/self"):
+        try:
+            with open("/proc/%d/stat" % pid, "rb") as fh:
+                stat = fh.read()
+            with open("/proc/%d/cmdline" % pid, "rb") as fh:
+                cmdline = fh.read()
+        except OSError:
+            return None
+        return stat[stat.rfind(b")") + 2 :][:1], cmdline
+    try:
+        out = subprocess.run(
+            ["ps", "-ww", "-o", "stat=", "-o", "command=", "-p", str(pid)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        ).stdout
+    except OSError:
+        return None
+    fields = out.strip().split(None, 1)
+    if not fields:
+        return None
+    return fields[0][:1], fields[1] if len(fields) > 1 else b""
+
+
 def process_alive(pid, marker=None):
     """Whether pid is a live process; with marker, also that its command line contains it.
 
-    The marker check keeps a recycled pid from passing for a runner or for pi
-    on systems with /proc.
+    The marker keeps a recycled pid from passing for the process it names.
     """
     if not pid or pid <= 0:
         return False
@@ -190,27 +220,18 @@ def process_alive(pid, marker=None):
     except ProcessLookupError:
         return False
     except PermissionError:
-        return True
-    proc_dir = "/proc/%d" % pid
-    if not os.path.isdir("/proc/self"):
-        return True
-    try:
-        with open(proc_dir + "/stat", "rb") as fh:
-            stat = fh.read()
-        if stat[stat.rfind(b")") + 2 :][:1] in (b"Z", b"X"):
-            return False
-        if marker is not None:
-            with open(proc_dir + "/cmdline", "rb") as fh:
-                if marker not in fh.read():
-                    return False
-    except OSError:
+        # Not a process of this user, so neither a runner nor its pi.
+        return marker is None
+    info = process_info(pid)
+    if info is None or info[0] in (b"Z", b"X"):
         return False
-    return True
+    return marker is None or marker in info[1]
 
 
-def wait_for_exit(pid, marker, timeout):
+def wait_while(check, timeout):
+    """Poll check() until it is false; False if it is still true after timeout seconds."""
     end = time.monotonic() + timeout
-    while process_alive(pid, marker):
+    while check():
         if time.monotonic() >= end:
             return False
         time.sleep(0.1)
@@ -497,17 +518,50 @@ def job_path(job_dir, name):
     return os.path.join(job_dir, name)
 
 
+def lock_job(job_dir):
+    """Take the job's lock and return its descriptor, or None while a run holds it.
+
+    The lock is an flock on the file `lock`. A run takes it before it changes
+    any state and hands the descriptor to its runner, which holds it until it
+    exits. So a job is running exactly while its lock is held, and a recycled
+    pid cannot pass for a runner.
+    """
+    fd = os.open(job_path(job_dir, "lock"), os.O_RDWR | os.O_CREAT, 0o644)
+    end = time.monotonic() + LOCK_RETRY_S
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.monotonic() >= end:
+                os.close(fd)
+                return None
+            time.sleep(0.05)
+
+
+def job_running(job_dir):
+    """Whether a run holds the job's lock."""
+    try:
+        fd = os.open(job_path(job_dir, "lock"), os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+    return False
+
+
 def job_status(job_dir):
     """The job's status, with `died` (or `killed`) for a runner that vanished."""
     status = (read_text(job_path(job_dir, "status"), "") or "").strip() or "unknown"
     if status != "running" or os.path.exists(job_path(job_dir, "exit_code")):
         return status
-    runner = read_int(job_path(job_dir, "runner_pid"))
-    if runner is None:
-        started = parse_utc(read_text(job_path(job_dir, "started_at"), "") or "")
-        if started is not None and time.time() - started < START_GRACE_S:
-            return "running"
-    elif process_alive(runner, b"multi_agent"):
+    if job_running(job_dir):
         return "running"
     return "killed" if os.path.exists(job_path(job_dir, "killed")) else "died"
 
@@ -620,13 +674,16 @@ def short_args(args):
 class Runner:
     """Owns one pi RPC process for one run of a job.
 
-    caller_fd is the read end of a pipe whose only write end the foreground
-    `run` process holds. End of file on it means that process has ended, for
-    any reason, SIGKILL included, and the run stops.
+    lock_fd holds the job's lock (see lock_job) for as long as the runner
+    lives. caller_fd is the read end of a pipe whose only write end the
+    foreground `run` process holds. End of file on it means that process has
+    ended, for any reason, SIGKILL included, and the run stops.
     """
 
-    def __init__(self, job_dir, caller_fd=None):
+    def __init__(self, job_dir, lock_fd, caller_fd=None):
         self.job_dir = job_dir
+        self.lock_fd = lock_fd
+        os.set_inheritable(lock_fd, False)
         self.job = read_json(job_path(job_dir, "job.json"))
         self.prompt = read_text(job_path(job_dir, "prompt.txt"), "")
         self.caller_fd = caller_fd
@@ -640,13 +697,16 @@ class Runner:
         self.wake_r = None
         self.signum = None
         self.serial = 0
-        self.responses = {}
         self.prompt_response = None
         self.pending_acks = {}
         self.taken = set()
         self.settled = False
         self.last_stop = None
         self.last_error = None
+        # Text of this run's latest assistant message. pi's
+        # get_last_assistant_text would also return an earlier run's text,
+        # or the caller's after --fork.
+        self.last_text = None
         self.model_used = None
         self.usage = read_json(job_path(job_dir, "usage.json"), None) or {}
         self.abort_sent = False
@@ -792,8 +852,6 @@ class Runner:
                     self.ack(base, {"ok": True, "disposition": disposition})
                 else:
                     self.ack(base, {"ok": False, "error": record.get("error") or "steer failed"})
-            elif rid is not None:
-                self.responses[rid] = record
         elif kind == "tool_execution_start":
             self.progress("%s %s" % (record.get("toolName", "?"), short_args(record.get("args"))))
         elif kind == "message_end":
@@ -817,6 +875,13 @@ class Runner:
     def on_assistant_message(self, message):
         self.last_stop = message.get("stopReason")
         self.last_error = message.get("errorMessage")
+        content = message.get("content") or []
+        # As in pi's get_last_assistant_text, an aborted message without
+        # content keeps the text before it.
+        if content or self.last_stop != "aborted":
+            parts = content if isinstance(content, list) else [{"type": "text", "text": str(content)}]
+            text = "".join(p.get("text") or "" for p in parts if isinstance(p, dict) and p.get("type") == "text")
+            self.last_text = text.strip() or None
         if message.get("provider") and message.get("model"):
             self.model_used = "%s/%s" % (message["provider"], message["model"])
         elif message.get("model"):
@@ -831,18 +896,6 @@ class Runner:
 
     def progress(self, message):
         append_progress(self.job_dir, message)
-
-    def request(self, command, timeout):
-        rid = self.new_id(command["type"])
-        if not self.send(dict(command, id=rid)):
-            return None
-        end = time.monotonic() + timeout
-        while rid not in self.responses and not self.eof:
-            remaining = end - time.monotonic()
-            if remaining <= 0:
-                break
-            self.pump(min(0.2, remaining))
-        return self.responses.pop(rid, None)
 
     # -- control inbox --
 
@@ -921,21 +974,22 @@ class Runner:
                 self.send_abort()
             if self.stop_deadline is not None and now >= self.stop_deadline:
                 self.progress("agent did not settle after the abort")
-                return self.finish("timeout" if self.timing_out else "aborted", LAST_TEXT_TIMEOUT_S)
+                return self.finish("timeout" if self.timing_out else "aborted")
             if now >= next_inbox:
                 self.check_inbox()
                 next_inbox = now + INBOX_POLL_S
             if self.settled:
-                return self.finish(self.settled_status(), LAST_TEXT_TIMEOUT_S)
+                return self.finish(self.settled_status())
             response = self.prompt_response
             if response is not None and not response.get("success"):
-                return self.finish("failed", LAST_TEXT_TIMEOUT_S, response.get("error") or "prompt rejected")
+                return self.finish("failed", response.get("error") or "prompt rejected")
             if response is not None and (response.get("data") or {}).get("disposition") == "handled":
-                return self.finish("done", LAST_TEXT_TIMEOUT_S)
+                return self.finish("done")
             if self.eof:
                 return self.finish_eof()
             wait = INBOX_POLL_S
-            for limit in (deadline, self.stop_deadline):
+            # Once the timeout has fired, only the settle deadline is ahead.
+            for limit in (None if self.timing_out else deadline, self.stop_deadline):
                 if limit is not None:
                     wait = min(wait, limit - now)
             self.pump(wait)
@@ -949,19 +1003,14 @@ class Runner:
             return "failed"
         return "done"
 
-    def finish(self, status, text_timeout, error=None):
+    def finish(self, status, error=None):
         self.finishing = True
-        text = None
-        if not self.eof:
-            response = self.request({"type": "get_last_assistant_text"}, text_timeout)
-            if response and response.get("success"):
-                text = (response.get("data") or {}).get("text")
-        output = text or ""
+        self.stop_pi()
+        output = self.last_text or ""
         if status == "failed":
             detail = error or self.last_error
             if detail:
                 output = (output + "\n\n" if output else "") + "error: " + detail
-        self.stop_pi()
         return self.conclude(status, output)
 
     def finish_eof(self):
@@ -978,13 +1027,8 @@ class Runner:
         self.finishing = True
         write_atomic(job_path(self.job_dir, "killed"), "")
         self.progress(reason)
-        text = None
-        if not self.eof:
-            response = self.request({"type": "get_last_assistant_text"}, SIGNAL_TEXT_TIMEOUT_S)
-            if response and response.get("success"):
-                text = (response.get("data") or {}).get("text")
         self.stop_pi()
-        return self.conclude("killed", text or "")
+        return self.conclude("killed", self.last_text or "")
 
     def stop_pi(self):
         """Close pi's stdin, which makes it shut down; escalate to SIGTERM and SIGKILL."""
@@ -1034,9 +1078,9 @@ def format_seconds(value):
     return ("%g" % value) if value is not None else "none"
 
 
-def run_runner(job_dir, caller_fd=None):
+def run_runner(job_dir, lock_fd, caller_fd=None):
     """Run one job run to completion and return its final status."""
-    runner = Runner(job_dir, caller_fd)
+    runner = Runner(job_dir, lock_fd, caller_fd)
     try:
         return runner.run()
     except Exception:
@@ -1080,6 +1124,31 @@ def start_run(job_dir, job, prompt, background, timeout, run_kind):
     stays as the runner's caller: it waits for the runner, prints the result,
     and holds the write end of the pipe whose end of file stops the run.
     """
+    lock_fd = lock_job(job_dir)
+    if lock_fd is None:
+        raise CommandError("job %s is running; use steer, or wait for it to finish" % job["name"])
+    try:
+        proc, caller_w = start_runner(job_dir, job, lock_fd, prompt, background, timeout, run_kind)
+    finally:
+        # From here on only the runner holds the lock, so the job stops
+        # counting as running when the runner ends, even if this process stays.
+        os.close(lock_fd)
+    write_atomic(job_path(job_dir, "runner_pid"), "%d\n" % proc.pid)
+    if background:
+        sys.stdout.write("job: %s\nstatus: running\ntimeout_s: %s\n" % (job["name"], format_seconds(timeout)))
+        return EXIT_OK
+    note("started job %s" % job["name"])
+    return follow_runner(job_dir, proc, caller_w)
+
+
+def start_runner(job_dir, job, lock_fd, prompt, background, timeout, run_kind):
+    """Reset the job's state for a new run and start the runner; return it and the caller's pipe end.
+
+    Called with the job's lock held. If the runner cannot start, the run is
+    recorded as failed.
+    """
+    if not os.path.isdir(job["cwd"]):
+        raise CommandError("the job's working directory no longer exists: %s" % job["cwd"])
     job["mode"] = "background" if background else "foreground"
     job["timeout"] = timeout
     job["run_kind"] = run_kind
@@ -1095,33 +1164,43 @@ def start_run(job_dir, job, prompt, background, timeout, run_kind):
     write_atomic(job_path(job_dir, "started_at"), utcnow() + "\n")
     write_atomic(job_path(job_dir, "status"), "running\n")
 
-    argv = [sys.executable, SCRIPT_PATH, "__runner", job_dir]
+    argv = [sys.executable, SCRIPT_PATH, "__runner", job_dir, str(lock_fd)]
+    pass_fds = [lock_fd]
     caller_r = caller_w = None
     if not background:
         # os.pipe() descriptors are not inherited, so only the runner gets
         # the read end and only this process holds the write end.
         caller_r, caller_w = os.pipe()
         argv.append(str(caller_r))
-    proc = subprocess.Popen(
-        argv,
-        cwd=job["cwd"],
-        # Its own session, so the caller's process group and terminal never
-        # signal it. The caller's end is the pipe above.
-        start_new_session=True,
-        # No handle on the caller's stdout or stderr, so a command that runs
-        # this script never waits for the runner.
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        pass_fds=(caller_r,) if caller_r is not None else (),
-    )
-    write_atomic(job_path(job_dir, "runner_pid"), "%d\n" % proc.pid)
-    if background:
-        sys.stdout.write("job: %s\nstatus: running\ntimeout_s: %s\n" % (job["name"], format_seconds(timeout)))
-        return EXIT_OK
-    os.close(caller_r)
-    note("started job %s" % job["name"])
-    return follow_runner(job_dir, proc, caller_w)
+        pass_fds.append(caller_r)
+    try:
+        proc = subprocess.Popen(
+            argv,
+            cwd=job["cwd"],
+            # Its own session, so the caller's process group and terminal never
+            # signal it. The caller's end is the pipe above.
+            start_new_session=True,
+            # No handle on the caller's stdout or stderr, so a command that runs
+            # this script never waits for the runner.
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            pass_fds=pass_fds,
+        )
+    except OSError as exc:
+        for fd in (caller_r, caller_w):
+            if fd is not None:
+                os.close(fd)
+        message = "could not start the runner: %s" % exc
+        write_atomic(job_path(job_dir, "output.txt"), "error: %s\n" % message)
+        write_atomic(job_path(job_dir, "ended_at"), utcnow() + "\n")
+        write_atomic(job_path(job_dir, "status"), "failed\n")
+        write_atomic(job_path(job_dir, "exit_code"), "%d\n" % EXIT_FAIL)
+        append_progress(job_dir, "run %d ended: failed (%s)" % (runs, message))
+        raise CommandError(message)
+    if caller_r is not None:
+        os.close(caller_r)
+    return proc, caller_w
 
 
 def follow_runner(job_dir, proc, caller_w):
@@ -1150,10 +1229,11 @@ def follow_runner(job_dir, proc, caller_w):
 
 
 def cmd_runner(argv):
-    """Internal: the detached runner of a run. A foreground run passes the caller's pipe."""
+    """Internal: the detached runner of a run, holding the job's lock. A foreground run passes the caller's pipe."""
     job_dir = argv[0]
-    caller_fd = int(argv[1]) if len(argv) > 1 else None
-    run_runner(job_dir, caller_fd)
+    lock_fd = int(argv[1])
+    caller_fd = int(argv[2]) if len(argv) > 2 else None
+    run_runner(job_dir, lock_fd, caller_fd)
     return EXIT_OK
 
 
@@ -1405,7 +1485,12 @@ def cmd_abort(argv):
 
 
 def kill_job(job_dir):
-    """Stop one job by pid: the runner first, then pi if it outlives the runner."""
+    """Stop one job by pid: the runner first, then pi if it outlives the runner.
+
+    The runner's pid is signalled only while the job's lock shows the run
+    alive, and pi's only while its command line names this job's prompt
+    file, so a recycled pid is never signalled.
+    """
     name = os.path.basename(job_dir)
     status = job_status(job_dir)
     if status != "running":
@@ -1413,22 +1498,23 @@ def kill_job(job_dir):
     write_atomic(job_path(job_dir, "killed"), "")
     runner = read_int(job_path(job_dir, "runner_pid"))
     end = time.monotonic() + START_GRACE_S
-    while runner is None and time.monotonic() < end:
+    while runner is None and job_running(job_dir) and time.monotonic() < end:
         time.sleep(0.1)
         runner = read_int(job_path(job_dir, "runner_pid"))
-    if runner is not None and process_alive(runner, b"multi_agent"):
+    if runner is not None and job_running(job_dir):
         try:
             os.kill(runner, signal.SIGTERM)
         except OSError:
             pass
-        if not wait_for_exit(runner, b"multi_agent", KILL_GRACE_S):
+        if not wait_while(lambda: job_running(job_dir), RUNNER_STOP_GRACE_S):
             try:
                 os.kill(runner, signal.SIGKILL)
             except OSError:
                 pass
-            wait_for_exit(runner, b"multi_agent", 2)
+            wait_while(lambda: job_running(job_dir), 2)
     pi_pid = read_int(job_path(job_dir, "pi_pid"))
-    if pi_pid is not None and not wait_for_exit(pi_pid, b"rpc", KILL_GRACE_S):
+    pi_marker = job_path(job_dir, "append-prompt.md").encode()
+    if pi_pid is not None and not wait_while(lambda: process_alive(pi_pid, pi_marker), PI_KILL_GRACE_S):
         try:
             os.kill(pi_pid, signal.SIGKILL)
         except OSError:

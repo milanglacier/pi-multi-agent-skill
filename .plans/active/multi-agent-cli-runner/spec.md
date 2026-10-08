@@ -161,8 +161,11 @@ timeout_s: 3600
 ### resume
 
 Starts a new run of an existing job on the same pi session, with a new
-prompt. The job must not be running. It accepts `--background` and
-`--timeout` with the same meaning as `run`. The profile, model, thinking
+prompt. The job must not be running: `resume` takes the job's lock (see
+"Job lock"), so two resumes of one job can never both start a run. It
+fails before it changes any state if the job's working directory no longer
+exists. It accepts `--background` and `--timeout` with the same meaning as
+`run`. The profile, model, thinking
 level and tools come from the job's recorded launch settings.
 
 ### wait
@@ -206,13 +209,20 @@ respond.
 
 1. Write the `killed` marker and send SIGTERM to the runner, which stops pi
    (see "Signals and the end of the foreground command").
-2. If the runner is still alive after 10 seconds, send it SIGKILL. pi then
-   sees its stdin close and exits, possibly before it stops the agent's
-   commands (see "Limits").
+2. If the runner still holds the job's lock after 20 seconds, send it
+   SIGKILL. 20 seconds is longer than the runner's own stop sequence for pi
+   (10 seconds after closing pi's stdin, then 5 after SIGTERM), so a runner
+   that is still stopping pi keeps reading pi's stdout until pi is done.
+   Only a wedged runner gets SIGKILL; pi then sees its stdin close and
+   exits, possibly before it stops the agent's commands (see "Limits").
 3. If pi is still alive 10 seconds later, send SIGKILL to the pid in
    `pi_pid`.
 
-`kill` signals the runner and pi by pid. When the job is a foreground run,
+`kill` signals the runner and pi by pid, and guards both against a recycled
+pid: the runner's pid only while the job's lock shows the run alive, and
+pi's only while its command line contains the job's `append-prompt.md`
+path. The command line comes from `/proc`, or from `ps` where there is no
+`/proc`. When the job is a foreground run,
 the runner records the status `killed`, and the foreground command prints
 the result and exits with code 1.
 
@@ -452,13 +462,20 @@ is also an RPC host, and it forwards dialogs to a person in the browser.
 
 On `agent_settled` the runner:
 
-1. Sends `get_last_assistant_text` and writes the text to `output.txt`.
+1. Takes the text of this run's latest assistant message as the output.
+   The runner keeps it from `message_end` events, with the rules of pi's
+   `get_last_assistant_text`: the text parts joined and trimmed, and an
+   aborted message without content skipped. It does not ask pi, because
+   pi's answer covers the whole session, so a resumed or forked run that
+   ends before its first message would report an earlier run's text or the
+   caller's.
 2. Sets the status: `aborted` if an abort was requested or the last
    `stopReason` is `aborted`; `failed` if the last `stopReason` is `error`;
    `done` otherwise.
 3. Closes pi's stdin, which makes pi shut down. If pi has not exited after 10
    seconds, the runner sends SIGTERM, and SIGKILL 5 seconds later.
-4. Writes `exit_code` and `status`, then exits.
+4. Writes `output.txt`, `exit_code` and `status`, then exits, which
+   releases the job's lock.
 
 If pi's stdout reaches end of file before `agent_settled`, the job ends with
 status `failed`, and the last lines of `stderr.txt` are copied into
@@ -498,9 +515,11 @@ after the current tool calls finish.
 ### Timeout
 
 When the deadline passes, the runner sends RPC `abort` and waits up to 30
-seconds for `agent_settled`. The job ends with status `timeout`, and the last
-assistant text is its output. If pi does not settle, the runner closes pi's
-stdin and stops pi as in step 3 of "Finishing a run".
+seconds for `agent_settled`; while it waits, its event loop sleeps until
+that settle deadline and does not poll. The job ends with status `timeout`,
+and the last assistant text of this run is its output. If pi does not
+settle, the runner closes pi's stdin and stops pi as in step 3 of
+"Finishing a run".
 
 ### Signals and the end of the foreground command
 
@@ -508,10 +527,9 @@ The runner handles SIGTERM, SIGHUP and SIGINT, and the end of its
 foreground command (see "Lifetime"), the same way:
 
 1. Write the `killed` marker.
-2. Send `get_last_assistant_text`; if pi answers within 2 seconds, write the
-   text to `output.txt`.
-3. Close pi's stdin and stop pi as in step 3 of "Finishing a run".
-4. Write `exit_code` and the status `killed`, then exit.
+2. Close pi's stdin and stop pi as in step 3 of "Finishing a run".
+3. Write this run's last assistant text to `output.txt`, then `exit_code`
+   and the status `killed`, and exit.
 
 The foreground command handles SIGTERM, SIGHUP and SIGINT by closing its end
 of the pipe to the runner, waiting for the runner to record the result, and
@@ -606,7 +624,7 @@ once on the pipe's end of file.
   has no reader, exits on EPIPE, and the commands and background tasks of the
   agent keep running. `status` reports `died`. This is accepted: nothing in
   the normal flow sends SIGKILL to a runner, and `kill NAME` sends SIGTERM
-  first and waits 10 seconds.
+  first and waits longer than the runner's whole stop sequence.
 - If the caller's pi is killed with SIGKILL, it cannot stop its commands. A
   foreground command started by its `bash` tool keeps running, and so does
   the job, until the agent finishes.
@@ -649,6 +667,7 @@ name.
 | `system-prompt.md` | The profile's body in `replace` mode, passed with `--system-prompt`. |
 | `append-prompt.md` | Text passed with `--append-system-prompt`: the profile's body in `append` mode, then the multi-agent block. |
 | `status` | `running`, `done`, `failed`, `aborted`, `timeout`, `killed` or `died`. |
+| `lock` | The job's lock (see "Job lock"). |
 | `runner_pid`, `pi_pid` | Process IDs of the current run. |
 | `started_at`, `ended_at` | UTC timestamps of the current run. |
 | `runs` | Number of runs. |
@@ -664,9 +683,27 @@ name.
 
 State files are written through a temporary file and a rename.
 
-A job whose status is `running` but whose runner pid is gone, and which has
-no `exit_code` for the current run, is reported as `died`. `status`, `wait`
-and `list` apply this check.
+### Job lock
+
+`run` and `resume` take an exclusive `flock` on the job's `lock` file before
+they change any state, and pass the open descriptor to the runner, which
+holds it until it exits. The command closes its own copy as soon as the
+runner has started, also in the foreground. So the lock is held exactly
+while a runner lives, and:
+
+- A second `run` or `resume` of the job cannot take the lock and fails with
+  "job NAME is running", so two runners never write one session.
+- A job whose status is `running`, with no `exit_code` for the current run
+  and no one holding the lock, is reported as `died` (or `killed` when the
+  `killed` marker exists). `status`, `wait`, `list` and `kill` apply this
+  check. A recycled runner pid cannot make a dead job look alive, on any
+  system.
+
+Testing the lock takes a shared lock for a moment, so a `run` or `resume`
+that finds the lock taken tries again for up to a second before it fails.
+
+If the runner cannot be started, the run is recorded as `failed` with the
+error in `output.txt`, and the command fails with that error.
 
 ## SKILL.md contents
 
@@ -684,10 +721,14 @@ SKILL.md tells the agent:
    - For long or parallel tasks, run the foreground command with the
      harness's built-in tool for background commands when there is one. The
      job then stops when the caller's session ends. If the tool can wake the
-     agent on each output line, turn that off and wait for the exit. If the
-     tool has its own timeout, disable it or make it longer than the job's
-     `--timeout`, so the script's timeout decides when the job stops and the
-     job can record its status.
+     agent on each output line, turn that off and wait for the exit.
+   - Timeouts: a foreground run has none unless `--timeout` is given, and
+     stops when its command ends; a background run stops after 3600 seconds
+     by default. When a background tool with its own timeout runs the
+     foreground command, pass `--timeout` shorter than the tool's, so the
+     script's timeout decides when the job stops and the job records its
+     status. With the tool's timeout disabled, the job runs until the agent
+     finishes or the caller's session ends.
    - Use `--background` when there is no such tool, or when the work should
      continue after the caller ends. A background job keeps running until it
      finishes or reaches its timeout. Tell the user its name.
@@ -781,8 +822,19 @@ process group, and whether it exited because its stdin closed.
 - `steer` and `abort` through the inbox, including the acknowledgement and
   the "not running" error.
 - Dialog requests answered with `cancelled`.
-- Timeout handling.
-- Signal handling, `kill NAME` (also on a foreground run) and `kill --all`.
+- Timeout handling, including a pi that never settles after the abort:
+  the runner uses little CPU while it waits, and the job ends with
+  `timeout` after the settle deadline.
+- Signal handling (SIGTERM, SIGHUP and SIGINT to the foreground command and
+  to the runner), `kill NAME` (also on a foreground run) and `kill --all`.
+- `kill` on a pi whose shutdown takes 12 seconds and ignores SIGTERM: the
+  runner keeps reading until pi exits, so pi never hits EPIPE.
+- The job lock: concurrent resumes start one run; `kill` and `status` ignore
+  recycled pids; liveness checks work without `/proc`.
+- The output of a resumed or forked run that ends before its first message
+  is empty, not an earlier run's or the caller's text.
+- A resume whose working directory is gone, and a runner that cannot start,
+  keep or record the result and fail with a message.
 - SIGKILL to the runner: fake-pi sees its stdin close and exits, and the job
   is reported as `died`.
 - The depth limit.

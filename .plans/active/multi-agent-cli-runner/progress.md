@@ -226,3 +226,21 @@ runs `bg_task` `sleep 6002`, then `bash` `sleep 6001`):
   check script killed the leftover sleep.
 
 Check jobs and their session directories were removed afterwards.
+
+## Revision after review (2026-10-08)
+
+See "Revision after review" in plan.md for the decisions and the design,
+and the fix summary at the end of review.md.
+
+- Fixed findings 1, 2, 3, 4, 5, 7 and 10, and the SKILL.md part of 9.
+  Findings 6 and 8 are not fixed, by decision.
+- Tests: 59 pass with Python 3.14.7 and 3.9.25, about 85 s. Run against the
+  committed script, the new tests fail for findings 1, 2, 4 and 7. The
+  concurrent-resume test passed there too, because the race did not happen
+  in that run; it guards the lock from now on.
+- Real pi (`opencode-go/deepseek-v4.1-flash`, thinking off), through the
+  script: a background run and `wait` returned the result; a foreground
+  `resume` continued the conversation (the agent knew its earlier answer);
+  `kill` during a `bash` `sleep 6001` took 0.26 s, and pi and the sleep were
+  gone; the killed run's output was `(no output)`, not the earlier answer.
+  The job and its session were removed afterwards.

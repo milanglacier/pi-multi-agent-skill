@@ -62,7 +62,7 @@ For a long task, or several tasks in parallel:
   ends. The command prints `multi-agent: started job NAME` first; use that
   name for `steer` and `abort`. If the tool can wake you on each output line,
   turn that off and wait for the command to exit. If the tool has its own
-  timeout, disable it or make it longer than the job's `--timeout`.
+  timeout, see "Timeouts" below.
 - Otherwise, or when the work must continue after your session ends, add
   `--background`. The command prints the job name and returns at once. A
   background job runs until it finishes or reaches its timeout (one hour by
@@ -70,6 +70,19 @@ For a long task, or several tasks in parallel:
 - Never put the command in the background with `&`; use `--background`.
 
 Keep at most 4 jobs running at once unless the user asks for more.
+
+## Timeouts
+
+- A foreground `run` or `resume` has no timeout unless you pass
+  `--timeout S`. It stops when the agent finishes or when the command ends,
+  for example when your tool call is cancelled or your session ends.
+- A `--background` job stops after one hour unless you pass `--timeout S`.
+  `--timeout 0` removes the limit.
+- When a background tool of your harness runs the foreground command and the
+  tool has its own timeout, pass `--timeout` shorter than the tool's, so the
+  job stops itself and records its result first. If you disable the tool's
+  timeout instead, the job runs until the agent finishes or your session
+  ends.
 
 ## Wait for a result
 

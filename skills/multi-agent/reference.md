@@ -170,11 +170,12 @@ list of pi's `/resume`.
 | `system-prompt.md` | The profile's prompt when it replaces pi's system prompt. |
 | `append-prompt.md` | Text added to pi's system prompt: the profile's prompt in append mode, then the multi-agent block. |
 | `status` | Status of the latest run. |
+| `lock` | Held by the job's runner while it runs; a job is running exactly while it is held. |
 | `runner_pid`, `pi_pid` | Process IDs of the latest run. |
 | `started_at`, `ended_at` | UTC timestamps of the latest run. |
 | `runs` | Number of runs. |
 | `exit_code` | Exit code of the latest run, written last. |
-| `output.txt` | Final message of the latest run. |
+| `output.txt` | Final message of the latest run; empty if that run ended before its first message. |
 | `model` | Model that produced the latest message. |
 | `stderr.txt` | pi's stderr for the latest run. |
 | `progress.log` | One line per tool call, retry, compaction, cancelled dialog and steering message, across runs. |
@@ -206,5 +207,9 @@ because two processes would then write the same session file.
 - **A job lingers after its caller is gone.** Background jobs outlive their
   caller by design. Stop them with `kill NAME`, or `kill --all` when the user
   asks.
+- **`job NAME is running` from `resume`.** Another run of the job holds its
+  lock. `wait` for it, or `kill` it first.
+- **`the job's working directory no longer exists`.** `resume` runs the
+  agent in the directory the job was started in. Start a new job instead.
 - **`job ... exists in several projects`.** Run the command from the
   directory where the job was started.

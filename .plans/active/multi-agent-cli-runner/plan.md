@@ -3,7 +3,10 @@
 The design is in `spec.md` in this directory. This plan covers the order of
 work, what each step produces, and how each step is verified.
 
-Draft; not yet approved.
+Status: steps 1-8 and the revision after step 8 are implemented and
+committed (7d9fc57). The review in `review.md` led to a second revision,
+described at the end of this file. One check from step 8 is still open (see
+"Open items").
 
 ## Scope
 
@@ -11,9 +14,9 @@ Draft; not yet approved.
   the two built-in profiles, README.md, LICENSE and the tests.
 - No changes to other submodules. pi-minimal-permission-system and
   pi-background-tasks already have what the spec relies on.
-- `pi-multi-agent-skill/` stays a plain directory in the monorepo. Turning it
-  into a submodule, pushing, and replacing pi-subagents in the user's setup
-  are separate steps after this plan.
+- `pi-multi-agent-skill/` is a submodule of the monorepo, with its own
+  GitHub repo. Replacing pi-subagents in the user's setup is a separate step
+  after this plan.
 - Nothing is committed unless the user asks.
 
 ## Step 1: spike the risky assumptions with real pi
@@ -201,3 +204,64 @@ running, with status `died`. No harness path sends SIGKILL to the runner.
 
 Done when the suite passes on Python 3.9 and the current Python, and the
 real-pi checks show no process left after each path except the accepted one.
+
+## Revision after review
+
+`review.md` lists ten findings on commit 7d9fc57. The user's decisions:
+
+| # | Finding | Decision |
+|---|---|---|
+| 1 | `kill` SIGKILLs the runner while pi is still shutting down | Fix |
+| 2 | The runner busy-loops after a timeout | Fix |
+| 3 | Without `/proc`, `kill` can signal unrelated processes | Fix |
+| 4 | Result text can come from an earlier run or the caller | Fix |
+| 5 | `resume` can start two runners on one session | Fix |
+| 6 | `resume` bypasses the depth limit | Won't fix for now: rare, and needs an agent to resume a job another agent started |
+| 7 | A failed runner start deletes the previous result | Fix |
+| 8 | The multi-agent block costs agents their `APPEND_SYSTEM.md` | Won't fix: valid, but rare; the decision in "Revision after step 8" stands |
+| 9 | Foreground runs have no default timeout | Keep the design: a foreground run stops with its caller, so it needs no limit of its own. Fix SKILL.md, which is ambiguous about which runs have a timeout |
+| 10 | Test gaps and stale plan text | Fix |
+
+### Design of the fixes
+
+- **Job lock (3, 5).** Each job directory has a file `lock`. `run` and
+  `resume` take an exclusive `flock` on it before they change any state, and
+  hand the open descriptor to the runner, which holds it until it exits. A
+  job is running exactly while the lock is held. This replaces the pid and
+  command-line check for the runner, and the 10-second start grace. A second
+  `resume` fails to take the lock, so two runners can never share a session.
+  `kill` signals pids only while the lock shows the job running, and checks
+  pi's pid against the job directory in pi's command line, through `/proc`
+  or `ps`.
+- **Kill grace (1).** `kill` waits for the runner longer than the runner's
+  own stop sequence (pi's exit grace plus its SIGTERM grace, plus a margin)
+  before it sends SIGKILL. The runner already escalates against pi.
+- **Timeout loop (2).** Once the timeout has fired, the event loop waits on
+  the settle deadline only.
+- **Output of this run (4).** The runner keeps the text of this run's latest
+  assistant message from `message_end` events, with the same rules as pi's
+  `get_last_assistant_text`, and no longer asks pi for it. A run that
+  produces no message has no output.
+- **Failed start (7).** `start_run` checks that the job's cwd exists before
+  it changes any state. If starting the runner fails anyway, the run is
+  recorded as `failed` with the error, and the command fails with a message.
+- **SKILL.md (9).** State the timeout rules plainly: a foreground run has
+  no timeout unless `--timeout` is given and stops when its command ends; a
+  background run stops after 3600 seconds by default. Under a background
+  tool with its own timeout, either pass `--timeout` shorter than the tool's
+  or disable the tool's timeout and accept that the job runs until it
+  finishes or the caller's session ends.
+- **Tests (10).** The detachment test checks the runner's session. fake-pi
+  gains a pi that ignores `abort`, a pi that keeps writing during a slow
+  shutdown, and a session that records replies, so `get_last_assistant_text`
+  behaves like pi's. New tests: CPU use after a timeout, a slow shutdown
+  under `kill`, SIGHUP and SIGINT to the runner, output of an early-ended
+  resume and fork, concurrent resumes, a resume whose cwd is gone, and
+  `kill` with a recycled runner pid.
+
+### Open items
+
+- Step 8's interactive session did not reach `resume` of a finished job or a
+  `wait` that returns a result to the caller. Both are covered by tests
+  against fake-pi and by direct runs of the script with real pi, but not yet
+  by an agent using the skill.
