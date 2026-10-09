@@ -39,8 +39,23 @@ def wait_until(predicate, timeout=15, interval=0.05):
     raise AssertionError("condition not met within %ss" % timeout)
 
 
+def alive(pid):
+    """Whether pid is a live process; a zombie counts as gone where there is /proc."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:
+        with open("/proc/%d/stat" % pid) as fh:
+            return fh.read().rsplit(")", 1)[1].split()[0] not in ("Z", "X")
+    except OSError:
+        return not os.path.isdir("/proc/self")
+
+
 def pid_gone(pid):
-    return not ma.process_alive(pid)
+    return not alive(pid)
 
 
 def cpu_seconds(pid):
@@ -80,11 +95,14 @@ class Base(unittest.TestCase):
         self.addCleanup(self.kill_leftovers)
 
     def kill_leftovers(self):
-        for path in glob.glob(os.path.join(self.tmp, "state", "pi-multi-agent", "*", "jobs", "*", "*_pid")):
-            pid = ma.read_int(path)
-            marker = b"multi_agent" if path.endswith("runner_pid") else b"fake-pi"
-            if pid and pid != os.getpid() and ma.process_alive(pid, marker):
+        # Each runner and fake-pi has a path under self.tmp in its command line.
+        for record in self.records("start"):
+            for pid in (record["ppid"], record["pid"]):
                 try:
+                    with open("/proc/%d/cmdline" % pid, "rb") as fh:
+                        if os.fsencode(self.tmp) not in fh.read():
+                            continue
+                    os.kill(pid, signal.SIGCONT)
                     os.kill(pid, signal.SIGKILL)
                 except OSError:
                     pass
@@ -130,6 +148,10 @@ class Base(unittest.TestCase):
     def start_record(self, index=-1):
         records = wait_until(lambda: self.records("start"))
         return records[index]
+
+    def runner_pid(self, index=-1):
+        """The runner's pid, which is the parent of the fake-pi it started."""
+        return self.start_record(index)["ppid"]
 
     def exit_reasons(self):
         return [r["reason"] for r in self.records("exit")]
@@ -314,141 +336,55 @@ class NamesAndStateTest(Base):
         os.makedirs(job_dir)
         with open(os.path.join(job_dir, "job.json"), "w") as fh:
             json.dump({"name": name, "profile": "general-purpose", "session_dir": self.tmp}, fh)
+        files.setdefault("lock", "")
         for key, value in files.items():
             with open(os.path.join(job_dir, key), "w") as fh:
                 fh.write(value)
         return job_dir
 
-    def dead_pid(self):
-        proc = subprocess.Popen(["true"])
-        proc.wait()
-        return proc.pid
-
     def test_died_detection(self):
-        dead = "%d\n" % self.dead_pid()
-        self.assertEqual(ma.job_status(self.make_job("a", status="running\n", runner_pid=dead)), "died")
-        self.assertEqual(
-            ma.job_status(self.make_job("b", status="running\n", runner_pid=dead, killed="")), "killed"
-        )
-        self.assertEqual(
-            ma.job_status(self.make_job("c", status="running\n", runner_pid=dead, exit_code="0\n")), "running"
-        )
-        self.assertEqual(ma.job_status(self.make_job("d", status="done\n", runner_pid=dead)), "done")
-        # A live pid that is not a runner counts as gone.
-        self.assertEqual(
-            ma.job_status(self.make_job("e", status="running\n", runner_pid="%d\n" % os.getpid())), "died"
-        )
-        # Running while another command holds the job's lock, whatever the pids say.
-        locked = self.make_job("f", status="running\n")
-        with ma.job_lock(locked):
-            self.assertEqual(ma.job_status(locked), "running")
-            self.assertEqual(ma.job_status(locked, locked=True), "died")
+        self.assertEqual(ma.job_state(self.make_job("a", status="running\n")), "died")
+        self.assertEqual(ma.job_state(self.make_job("b", status="killed\n", exit_code="1\n")), "killed")
+        self.assertEqual(ma.job_state(self.make_job("c", status="done\n", exit_code="0\n")), "done")
+        # Only the exit code makes a status final.
+        self.assertEqual(ma.job_state(self.make_job("d", status="done\n")), "died")
+        # Without a lock file, the files decide.
+        no_lock = self.make_job("e", status="done\n", exit_code="0\n")
+        os.remove(os.path.join(no_lock, "lock"))
+        self.assertEqual(ma.job_state(no_lock), "done")
+        # Running while anyone holds the lock exclusively, whatever the files say.
+        locked = self.make_job("f", status="done\n", exit_code="0\n")
+        fd = ma.job_lock(locked, "busy")
+        try:
+            self.assertEqual(ma.job_state(locked), "running")
             with mock.patch.object(ma, "LOCK_TIMEOUT_S", 0.2), self.assertRaises(ma.CommandError) as ctx:
-                with ma.job_lock(locked):
-                    pass
-            self.assertIn("is busy", str(ctx.exception))
-        self.assertEqual(ma.job_status(locked), "died")
-
-    def sleeper(self, *args):
-        """A live process whose command line ends with args."""
-        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"] + list(args))
-        self.addCleanup(proc.wait)
-        self.addCleanup(proc.kill)
-        wait_until(lambda: ma.process_alive(proc.pid, os.fsencode(args[-1] + " ")))
-        return proc.pid
-
-    def test_running_by_runner_or_pi(self):
-        # Each of the runner and pi keeps the job running, but only while
-        # its command line names this job.
-        runner = self.make_job("by-runner", status="running\n")
-        with open(os.path.join(runner, "runner_pid"), "w") as fh:
-            fh.write("%d\n" % self.sleeper("__runner", runner))
-        self.assertEqual(ma.job_status(runner), "running")
-        pi = self.make_job("by-pi", status="running\n", runner_pid="%d\n" % self.dead_pid())
-        with open(os.path.join(pi, "pi_pid"), "w") as fh:
-            fh.write("%d\n" % self.sleeper(os.path.join(pi, "append-prompt.md")))
-        self.assertEqual(ma.job_status(pi), "running")
-        # A job whose name extends this one's does not count.
-        other = self.make_job("by-runner-2", status="running\n")
-        with open(os.path.join(other, "runner_pid"), "w") as fh:
-            fh.write("%d\n" % self.sleeper("__runner", other))
-        prefix = self.make_job("by-runne", status="running\n")
-        with open(os.path.join(prefix, "runner_pid"), "w") as fh:
-            fh.write(ma.read_text(os.path.join(other, "runner_pid")))
-        self.assertEqual(ma.job_status(prefix), "died")
+                ma.job_lock(locked, "job f is running")
+            self.assertEqual(str(ctx.exception), "job f is running")
+        finally:
+            os.close(fd)
+        self.assertEqual(ma.job_state(locked), "done")
 
     def test_lock_of_a_removed_job(self):
         job_dir = self.make_job("removed", status="done\n", exit_code="0\n")
         shutil.rmtree(job_dir)
         with self.assertRaises(ma.CommandError) as ctx:
-            with ma.job_lock(job_dir):
-                pass
+            ma.job_lock(job_dir, "busy")
         self.assertIn("was removed", str(ctx.exception))
 
-    def test_process_alive_without_proc(self):
-        isdir = os.path.isdir
-        sleeper = subprocess.Popen(["sleep", "30"])
-        self.addCleanup(sleeper.wait)
-        self.addCleanup(sleeper.kill)
-        with mock.patch.object(ma.os.path, "isdir", lambda p: False if p == "/proc/self" else isdir(p)):
-            self.assertTrue(ma.process_alive(sleeper.pid))
-            self.assertTrue(ma.process_alive(sleeper.pid, b"sleep 30"))
-            self.assertFalse(ma.process_alive(sleeper.pid, b"multi_agent"))
-            sleeper.kill()
-            # A zombie counts as gone.
-            wait_until(lambda: not ma.process_alive(sleeper.pid))
-            sleeper.wait()
-            self.assertFalse(ma.process_alive(sleeper.pid))
+    def test_lock_of_a_job_removed_while_waiting(self):
+        job_dir = self.make_job("removed", status="done\n", exit_code="0\n")
+        holder = ma.job_lock(job_dir, "busy")
+        remover = mock.patch.object(ma.time, "sleep", lambda _s: (shutil.rmtree(job_dir), os.close(holder)))
+        with remover, self.assertRaises(ma.CommandError) as ctx:
+            ma.job_lock(job_dir, "busy")
+        self.assertIn("was removed", str(ctx.exception))
 
-    def test_process_watch(self):
-        sleeper = subprocess.Popen(["sleep", "30"])
-        self.addCleanup(sleeper.wait)
-        self.addCleanup(sleeper.kill)
-        wait_until(lambda: ma.process_alive(sleeper.pid, b"sleep 30 "))
-        self.assertIsNone(ma.process_watch(sleeper.pid, b"multi_agent"))
-        self.assertIsNone(ma.process_watch(self.dead_pid(), None))
-        alive = ma.process_watch(sleeper.pid, b"sleep 30 ")
-        self.assertTrue(alive())
-        sleeper.kill()
-        # With /proc, a zombie counts as gone.
-        wait_until(lambda: not alive())
-
-    def test_process_watch_without_proc(self):
-        # The command line is read with one `ps`; polling starts no process.
-        isdir = os.path.isdir
-        sleeper = subprocess.Popen(["sleep", "30"])
-        self.addCleanup(sleeper.wait)
-        self.addCleanup(sleeper.kill)
-        wait_until(lambda: ma.process_alive(sleeper.pid, b"sleep 30 "))
-        with mock.patch.object(ma.os.path, "isdir", lambda p: False if p == "/proc/self" else isdir(p)), \
-                mock.patch.object(ma.subprocess, "run", wraps=subprocess.run) as run:
-            alive = ma.process_watch(sleeper.pid, b"sleep 30 ")
-            for _ in range(20):
-                self.assertTrue(alive())
-            self.assertEqual(run.call_count, 1)
-            sleeper.kill()
-            sleeper.wait()
-            self.assertFalse(alive())
-            self.assertEqual(run.call_count, 1)
-
-    def test_kill_ignores_recycled_pids(self):
-        # The runner died without recording a result, and its pid and pi's
-        # now belong to other processes.
-        others = [subprocess.Popen(["sleep", "30"]) for _ in range(2)]
-        for proc in others:
-            self.addCleanup(proc.wait)
-            self.addCleanup(proc.kill)
-        self.make_job(
-            "recycled",
-            status="running\n",
-            runner_pid="%d\n" % others[0].pid,
-            pi_pid="%d\n" % others[1].pid,
-        )
-        result = self.cli("kill", "recycled")
-        self.assertEqual(result.stdout, "job: recycled\nstatus: died (not running)\n")
-        self.assertIn("status: died\n", self.cli("status", "recycled").stdout)
-        for proc in others:
-            self.assertIsNone(proc.poll())
+    def test_socket_path(self):
+        job_dir = os.path.join(ma.jobs_dir(self.project), "x")
+        path = ma.socket_path(job_dir)
+        self.assertEqual(os.path.dirname(path), os.path.join(self.tmp, "state", "pi-multi-agent", "sockets"))
+        self.assertRegex(os.path.basename(path), r"^[0-9a-f]{16}\.sock$")
+        self.assertNotEqual(path, ma.socket_path(job_dir + "y"))
 
     def test_read_only_commands_on_hand_made_jobs(self):
         self.make_job(
@@ -477,7 +413,7 @@ class NamesAndStateTest(Base):
         self.assertNotIn("done-job", self.cli("list").stdout)
         self.assertIn("done-job", self.cli("list", "--all").stdout)
 
-        self.make_job("dead-job", status="running\n", runner_pid="%d\n" % self.dead_pid())
+        self.make_job("dead-job", status="running\n")
         self.assertIn("status: died", self.cli("status", "dead-job").stdout)
         result = self.cli("wait", "dead-job")
         self.assertEqual(result.returncode, 1)
@@ -637,7 +573,7 @@ class ForegroundTest(Base):
     def test_timeout_when_pi_does_not_settle(self):
         env = {"FAKE_PI_DELAY": "120", "FAKE_PI_IGNORE_ABORT": "1"}
         self.run_bg("unsettled", env=env, extra=("--timeout", "1"))
-        runner = ma.read_int(os.path.join(self.job_dir("unsettled"), "runner_pid"))
+        runner = self.runner_pid()
         wait_until(lambda: "timeout after 1s" in self.state("unsettled", "progress.log"))
         # The runner waits for pi to settle without spinning.
         before = cpu_seconds(runner)
@@ -649,6 +585,14 @@ class ForegroundTest(Base):
         self.assertTrue(result.stdout.startswith("(no output)\n"))
         self.assertIn("agent did not settle after the abort", self.state("unsettled", "progress.log"))
         self.assertEqual(self.records("exit")[-1]["reason"], "stdin_closed")
+
+    def test_socket_path_too_long(self):
+        state = os.path.join(self.tmp, "s" * 80)
+        result = self.cli("run", "--name", "long", "x", env={"XDG_STATE_HOME": state})
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("the socket path for this job is too long; set XDG_STATE_HOME to a shorter path", result.stderr)
+        self.assertFalse(glob.glob(os.path.join(state, "pi-multi-agent", "*", "jobs", "*")))
+        self.assertFalse(self.records("start"))
 
     def test_existing_name_is_refused(self):
         self.cli("run", "--name", "dup", "x")
@@ -669,7 +613,6 @@ class ForegroundTest(Base):
             self.assertEqual(proc.returncode, 1)
             self.assertIn("status: killed", out)
             self.assertEqual(self.state(name, "status"), "killed\n")
-            self.assertTrue(os.path.exists(os.path.join(self.job_dir(name), "killed")))
             wait_until(lambda: pid_gone(pi_pid))
             self.assertEqual(self.records("exit")[-1], {"reason": "stdin_closed", "pid": pi_pid})
             self.assertIn("stopped: the caller's command ended", self.state(name, "progress.log"))
@@ -677,7 +620,7 @@ class ForegroundTest(Base):
     def test_runner_is_detached_from_the_caller(self):
         proc = self.popen("run", "--name", "detached", "x", env={"FAKE_PI_DELAY": "2"})
         start = self.start_record()
-        runner = wait_until(lambda: ma.read_int(os.path.join(self.job_dir("detached"), "runner_pid")))
+        runner = start["ppid"]
         self.assertNotEqual(runner, proc.pid)
         # The runner leads its own session, apart from the foreground
         # command's and from pi's.
@@ -702,7 +645,7 @@ class ForegroundTest(Base):
         caller = self.caller_in_own_group("run", "--name", "orphaned", "x", env={"FAKE_PI_DELAY": "60"})
         self.addCleanup(caller.communicate)
         pi_pid = self.start_record()["pid"]
-        runner = ma.read_int(os.path.join(self.job_dir("orphaned"), "runner_pid"))
+        runner = self.runner_pid()
         os.killpg(caller.pid, signal.SIGKILL)
         wait_until(lambda: pid_gone(pi_pid))
         wait_until(lambda: pid_gone(runner))
@@ -723,7 +666,7 @@ class ForegroundTest(Base):
         pis = [record["pid"] for record in starts]
         inner_caller = self.records("tool")[0]["tool_pid"]
         self.assertEqual(self.start_record()["env"]["MULTI_AGENT_DEPTH"], "2")
-        runners = [ma.read_int(os.path.join(self.job_dir(n), "runner_pid")) for n in ("outer", "inner")]
+        runners = [record["ppid"] for record in starts]
         os.killpg(caller.pid, signal.SIGKILL)
         for pid in pis + runners + [inner_caller]:
             wait_until(lambda: pid_gone(pid))
@@ -764,8 +707,7 @@ class BackgroundTest(Base):
             os.killpg(caller.pid, signal.SIGKILL)
         except OSError:
             pass
-        runner = ma.read_int(os.path.join(self.job_dir("orphan"), "runner_pid"))
-        self.assertTrue(ma.process_alive(runner))
+        self.assertTrue(alive(self.runner_pid()))
         result = self.cli("wait", "orphan")
         self.assertEqual(result.returncode, 0)
         self.assertIn("status: done", result.stdout)
@@ -777,6 +719,8 @@ class BackgroundTest(Base):
 
     def test_steer_and_not_running(self):
         self.run_bg("st", env={"FAKE_PI_DELAY": "3"})
+        # Sent at once: the runner is still starting, and the request waits
+        # in the socket's listen backlog until the runner accepts it.
         steer = self.cli("steer", "st", "-", input="look at Y too\n")
         self.assertEqual(steer.returncode, 0, steer.stderr)
         self.assertEqual(steer.stdout, "job: st\nsteer: queued\n")
@@ -786,7 +730,8 @@ class BackgroundTest(Base):
         late = self.cli("steer", "st", "more")
         self.assertEqual(late.returncode, 1)
         self.assertIn("job is not running; use resume", late.stderr)
-        self.assertEqual(os.listdir(os.path.join(self.job_dir("st"), "inbox")), [])
+        # The runner removes its socket when it exits.
+        self.assertFalse(os.path.exists(ma.socket_path(self.job_dir("st"))))
 
     def test_abort_keeps_output(self):
         self.run_bg("ab", env={"FAKE_PI_DELAY": "60"})
@@ -798,7 +743,9 @@ class BackgroundTest(Base):
         self.assertEqual(waited.returncode, 1)
         self.assertIn("reply to: task (turn 1)", waited.stdout)
         self.assertIn("status: aborted", waited.stdout)
-        self.assertEqual(self.cli("abort", "ab").returncode, 1)
+        late = self.cli("abort", "ab")
+        self.assertEqual(late.returncode, 1)
+        self.assertIn("job is not running; use resume", late.stderr)
 
     def test_resume_and_rm(self):
         self.run_bg("res")
@@ -846,29 +793,23 @@ class BackgroundTest(Base):
         result = self.cli("result", "forked-early")
         self.assertTrue(result.stdout.startswith("(no output)\n"), result.stdout)
 
-    def test_kill_leaves_a_new_run_alone(self):
-        # Another caller resumes the job once kill has stopped its runner.
-        self.run_bg("race", env={"FAKE_PI_DELAY": "60"})
-        self.start_record()
-        job_dir = self.job_dir("race")
-        wait_while = ma.wait_while
-        resumed = []
-
-        def wait_then_resume(check, timeout):
-            done = wait_while(check, timeout)
-            if not resumed:
-                resumed.append(self.cli("resume", "race", "--background", "again", env={"FAKE_PI_DELAY": "60"}))
-            return done
-
-        with mock.patch.object(ma, "wait_while", wait_then_resume):
-            out = ma.kill_job(job_dir)
-        self.assertEqual(resumed[0].returncode, 0, resumed[0].stderr)
-        self.assertEqual(out, "job: race\nstatus: running\n")
-        self.assertEqual(self.state("race", "runs"), "2\n")
-        self.assertEqual(self.state("race", "status"), "running\n")
-        self.assertFalse(os.path.exists(os.path.join(job_dir, "exit_code")))
-        wait_until(lambda: len(self.records("start")) == 2)
-        self.assertEqual(self.cli("kill", "race").stdout, "job: race\nstatus: killed\n")
+    def test_list_while_a_resume_starts(self):
+        # A starter resets the job's files under the lock, so no reader ever
+        # sees a run that has no runner yet.
+        self.run_bg("starting")
+        self.cli("wait", "starting")
+        job_dir = self.job_dir("starting")
+        for turn in range(2, 5):
+            proc = self.popen("resume", "starting", "--background", "again", env={"FAKE_PI_DELAY": "0.5"})
+            states = set()
+            while proc.poll() is None or len(self.records("start")) < turn:
+                states.add(ma.job_state(job_dir))
+                time.sleep(0.001)
+            _out, err = proc.communicate()
+            self.assertEqual(proc.returncode, 0, err)
+            self.assertIn("starting", self.cli("list").stdout)
+            self.assertIn("reply to: again (turn %d)" % turn, self.cli("wait", "starting").stdout)
+            self.assertLessEqual(states, {"done", "running"})
 
     def test_concurrent_resumes_start_one_run(self):
         self.run_bg("twice")
@@ -906,7 +847,7 @@ class BackgroundTest(Base):
             with self.assertRaises(ma.CommandError) as ctx:
                 ma.cmd_resume(["nostart", "again"])
         self.assertIn("could not start the runner", str(ctx.exception))
-        self.assertFalse(ma.job_running(job_dir))
+        self.assertEqual(ma.job_state(job_dir), "failed")
         result = self.cli("result", "nostart")
         self.assertIn("status: failed", result.stdout)
         self.assertIn("error: could not start the runner: no such program", result.stdout)
@@ -958,18 +899,6 @@ class KillTest(Base):
         self.assertEqual(again.returncode, 0)
         self.assertIn("not running", again.stdout)
 
-    def test_kill_without_proc_starts_few_ps(self):
-        # pi takes 2 s to shut down, which kill would otherwise poll with a
-        # `ps` every 0.1 s.
-        self.run_bg("kp", env={"FAKE_PI_DELAY": "60", "FAKE_PI_SLOW_EXIT": "2"})
-        pi_pid = self.start_record()["pid"]
-        isdir = os.path.isdir
-        with mock.patch.object(ma.os.path, "isdir", lambda p: False if p == "/proc/self" else isdir(p)), \
-                mock.patch.object(ma.subprocess, "run", wraps=subprocess.run) as run:
-            self.assertEqual(ma.kill_job(self.job_dir("kp")), "job: kp\nstatus: killed\n")
-        self.assertLess(run.call_count, 10)
-        self.assertTrue(pid_gone(pi_pid))
-
     def test_kill_foreground_job(self):
         proc = self.popen("run", "--name", "kf", "x", env={"FAKE_PI_DELAY": "60"})
         self.start_record()
@@ -991,40 +920,79 @@ class KillTest(Base):
         self.assertEqual(self.state("ka3", "status"), "done\n")
         self.assertEqual(self.cli("kill", "--all").stdout, "no running jobs in this project\n")
 
-    def test_sigkill_to_runner(self):
-        self.run_bg("sk", env={"FAKE_PI_DELAY": "60"})
+    def sigkill_runner(self, name):
+        """Start a background job and SIGKILL its runner, which leaves its socket file behind."""
+        count = len(self.records("start"))
+        self.run_bg(name, env={"FAKE_PI_DELAY": "60"})
+        wait_until(lambda: len(self.records("start")) > count)
         pi_pid = self.start_record()["pid"]
-        runner = ma.read_int(os.path.join(self.job_dir("sk"), "runner_pid"))
-        os.kill(runner, signal.SIGKILL)
+        os.kill(self.runner_pid(), signal.SIGKILL)
         wait_until(lambda: pid_gone(pi_pid))
         self.assertEqual(self.records("exit")[-1], {"reason": "stdin_closed", "pid": pi_pid})
+        self.assertTrue(os.path.exists(ma.socket_path(self.job_dir(name))))
+
+    def test_sigkill_to_runner(self):
+        self.sigkill_runner("sk")
         self.assertIn("status: died", self.cli("status", "sk").stdout)
         result = self.cli("wait", "sk")
         self.assertEqual(result.returncode, 1)
         self.assertIn("status: died", result.stdout)
+        # The leftover socket file is never trusted.
+        for args in (("steer", "sk", "more"), ("abort", "sk")):
+            result = self.cli(*args)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("job is not running; use resume", result.stderr)
+        self.assertEqual(self.cli("kill", "sk").stdout, "job: sk\nstatus: died (not running)\n")
+        # resume binds over the leftover socket file.
+        result = self.cli("resume", "sk", "--background", "again", env={"FAKE_PI_DELAY": "3"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        steer = self.cli("steer", "sk", "and this")
+        self.assertEqual(steer.stdout, "job: sk\nsteer: queued\n", steer.stderr)
+        result = self.cli("wait", "sk")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("reply to: again (turn 2) | steered: and this", result.stdout)
 
-    def test_pi_that_outlives_its_runner_keeps_the_job_running(self):
-        env = {"FAKE_PI_DELAY": "60", "FAKE_PI_IGNORE_EOF": "1"}
-        self.run_bg("outlived", env=env)
-        pi_pid = self.start_record()["pid"]
-        runner = ma.read_int(os.path.join(self.job_dir("outlived"), "runner_pid"))
-        os.kill(runner, signal.SIGKILL)
-        wait_until(lambda: pid_gone(runner))
-        self.assertIn("status: running", self.cli("status", "outlived").stdout)
-        result = self.cli("resume", "outlived", "again")
+    def test_rm(self):
+        self.run_bg("rm-busy", env={"FAKE_PI_DELAY": "60"})
+        self.start_record()
+        start = time.monotonic()
+        result = self.cli("rm", "rm-busy")
         self.assertEqual(result.returncode, 1)
-        self.assertIn("is running", result.stderr)
-        self.assertEqual(len(self.records("start")), 1)
-        self.assertEqual(self.cli("kill", "outlived", timeout=60).stdout, "job: outlived\nstatus: killed\n")
-        self.assertTrue(pid_gone(pi_pid))
+        self.assertIn("job rm-busy is running; kill it first", result.stderr)
+        self.assertLess(time.monotonic() - start, 10)
+        self.assertIn("status: running", self.cli("status", "rm-busy").stdout)
+        self.cli("kill", "rm-busy")
+
+        self.sigkill_runner("rm-died")
+        sock = ma.socket_path(self.job_dir("rm-died"))
+        result = self.cli("rm", "rm-died")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(os.path.exists(sock))
+
+    def test_stuck_runner(self):
+        self.run_bg("stuck", env={"FAKE_PI_DELAY": "60"})
+        pi_pid = self.start_record()["pid"]
+        runner = self.runner_pid()
+        os.kill(runner, signal.SIGSTOP)
+        start = time.monotonic()
+        result = self.cli("kill", "stuck")
+        self.assertLess(time.monotonic() - start, 15)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("the runner of job stuck is not responding; to stop it, run: pkill -KILL -f ", result.stderr)
+        self.assertIn("status: running", self.cli("status", "stuck").stdout)
+        # The printed command stops the runner, and nothing else.
+        command = result.stderr.split("run: ", 1)[1].strip()
+        self.assertEqual(subprocess.run(["/bin/sh", "-c", command]).returncode, 0)
+        wait_until(lambda: pid_gone(runner))
+        wait_until(lambda: pid_gone(pi_pid))
+        self.assertIn("status: died", self.cli("status", "stuck").stdout)
 
     def test_signals_to_the_runner(self):
         for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
             name = "rsig-%d" % signum
             self.run_bg(name, env={"FAKE_PI_DELAY": "60"})
             pi_pid = wait_until(lambda: len(self.records("start")) == len(self.records("exit")) + 1 and self.start_record()["pid"])
-            runner = ma.read_int(os.path.join(self.job_dir(name), "runner_pid"))
-            os.kill(runner, signum)
+            os.kill(self.runner_pid(), signum)
             wait_until(lambda: self.state(name, "status") == "killed\n")
             wait_until(lambda: pid_gone(pi_pid))
             self.assertEqual(self.records("exit")[-1], {"reason": "stdin_closed", "pid": pi_pid})

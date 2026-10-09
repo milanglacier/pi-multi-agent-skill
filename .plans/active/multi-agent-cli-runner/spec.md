@@ -880,3 +880,26 @@ process group, and whether it exited because its stdin closed.
    process tree and the task. Repeat with the caller's `bash` tool call
    aborted from the TUI, and with two nested foreground runs. SIGKILL to the
    runner itself shows the accepted gap in "Limits".
+
+## Later change: the runner owns its job (2026-10-09)
+
+The sections above on liveness and control ("Job lock", "Control inbox",
+"kill", "rm", the `runner_pid`, `pi_pid`, `killed` and `inbox/` entries of
+"Job directory", and "Limits") describe the design of fe5d747. They no
+longer match the script. The current design is in
+`../runner-owns-job/plan.md`, and `../runner-owns-job/progress.md` lists
+where the implementation differs from that plan. In short:
+
+- The runner holds an exclusive `flock` on `<job>/lock` for its whole
+  life. The starter takes the lock and hands the locked fd to the runner.
+  A job is running exactly while the lock is held. Pids are no longer
+  read.
+- `steer`, `abort` and `kill` reach the runner through a Unix socket at
+  `<state root>/sockets/<sha256(job dir)[:16]>.sock`, one JSON request
+  and one reply per connection. `kill` writes nothing; the runner records
+  `killed` itself.
+- Only the runner writes a run's state. Readers read it under a shared
+  lock, and a run with no `exit_code` and a free lock is `died`.
+- A runner killed with SIGKILL orphans its pi, and the job reads as `died`
+  at once. A stuck runner is not killed automatically; `kill` prints a
+  `pkill` command instead.

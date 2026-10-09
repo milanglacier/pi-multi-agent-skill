@@ -73,6 +73,11 @@ the last progress line, and exits with code 2.
 `abort` prints `abort: requested`. Both fail with `job is not running; use
 resume` when the job has ended.
 
+`kill` prints the job name and the status the job ended with. On a job that
+is not running it prints the status followed by `(not running)`. `kill
+--all` prints the same for each job it stopped and exits with code 1 if
+any of them failed.
+
 ### Exit codes
 
 | Code | Meaning |
@@ -92,7 +97,7 @@ resume` when the job has ended.
 | `aborted` | `abort` stopped the agent. The output is its last message. |
 | `timeout` | The run reached its `--timeout`. The output is the agent's last message. |
 | `killed` | `kill`, a signal to the runner, or the end of a foreground command stopped the job. |
-| `died` | The job's processes ended without recording a result, for example after the runner was killed with SIGKILL. |
+| `died` | The job's runner ended without recording a result, for example after it was killed with SIGKILL. |
 
 ## Profiles
 
@@ -151,16 +156,18 @@ or unset for the user's agent, 1 for an agent it started, and so on. `run` and
   reaches its timeout, or is stopped with `kill`.
 - Each job is run by a separate runner process. Stopping a job through any of
   the paths above lets the agent shut down cleanly. If the runner itself is
-  killed with SIGKILL, the job counts as running until its pi exits too,
-  then its status becomes `died`, and commands the agent was running may
-  keep running.
+  killed with SIGKILL, the job's status becomes `died` at once. The agent's
+  pi process usually exits within a second, but commands the agent was
+  running may keep running.
 
 ## State
 
 Job directories are in
 `$XDG_STATE_HOME/pi-multi-agent/<project>/jobs/<name>/` (default
 `~/.local/state`). `<project>` is the current directory with every character
-other than a letter or digit replaced by `-`. Conversations are pi session
+other than a letter or digit replaced by `-`. A running job's runner listens
+on a Unix socket in `$XDG_STATE_HOME/pi-multi-agent/sockets/`, which
+`steer`, `abort` and `kill` connect to. Conversations are pi session
 files in `$PI_CODING_AGENT_DIR/multi-agent-sessions/<project>/`, outside the
 list of pi's `/resume`.
 
@@ -170,9 +177,8 @@ list of pi's `/resume`.
 | `prompt.txt` | Prompt of the latest run. |
 | `system-prompt.md` | The profile's prompt when it replaces pi's system prompt. |
 | `append-prompt.md` | Text added to pi's system prompt: the profile's prompt in append mode, then the multi-agent block. |
-| `status` | Status of the latest run. |
-| `lock` | Held for a moment by a command that starts a run, records its end or removes the job, so two such commands never interleave. |
-| `runner_pid`, `pi_pid` | Process IDs of the latest run. The job is running while either process is alive. |
+| `status` | Status of the latest run, final once `exit_code` exists. |
+| `lock` | Held by the job's runner for as long as it runs. The job is running exactly while this lock is held. |
 | `started_at`, `ended_at` | UTC timestamps of the latest run. |
 | `runs` | Number of runs. |
 | `exit_code` | Exit code of the latest run, written last. |
@@ -181,8 +187,6 @@ list of pi's `/resume`.
 | `stderr.txt` | pi's stderr for the latest run. |
 | `progress.log` | One line per tool call, retry, compaction, cancelled dialog and steering message, across runs. |
 | `usage.json` | Token and cost totals across runs. |
-| `killed` | Marker written when the job is killed. |
-| `inbox/` | Requests from `steer` and `abort` and the runner's answers. |
 | `runner.log` | Traceback when the runner itself fails. |
 
 To read a finished job's whole conversation in interactive pi, run the
@@ -198,9 +202,12 @@ because two processes would then write the same session file.
   whole log is in `stderr.txt`. A model or tool name that pi rejects causes
   this.
 - **Status `died`.** The runner was killed without a chance to record a
-  result. The agent's pi process exits by itself, but commands it started can
-  survive; look for them with `ps` if the agent was running a long command.
-  `peek` shows how far it got; `resume` continues the conversation.
+  result. The agent's pi process exits by itself, usually within a second,
+  but commands it started can survive; look for them with `ps` if the agent
+  was running a long command. `peek` shows how far it got; `resume`
+  continues the conversation. Wait a few seconds before you `resume` a job
+  that has just died, so its old pi has exited and does not write the
+  conversation at the same time as the new one.
 - **An agent reports that a tool call needs approval.** Agents cannot ask a
   person. Run that step yourself, or tell the user what was blocked.
 - **`cannot start an agent: ... MULTI_AGENT_MAX_DEPTH`.** The caller is too
@@ -208,10 +215,19 @@ because two processes would then write the same session file.
 - **A job lingers after its caller is gone.** Background jobs outlive their
   caller by design. Stop them with `kill NAME`, or `kill --all` when the user
   asks.
-- **`job NAME is running` from `resume`.** The job's runner or its pi is
-  still alive. `wait` for it, or `kill` it first.
-- **`job NAME is busy`.** Another command was starting, killing or removing
-  the job at the same moment. Try again.
+- **`job NAME is running` from `resume` or `rm`.** The job's runner is
+  still alive, or another command was starting the job at the same moment.
+  `wait` for it, or `kill` it first.
+- **`the runner of job NAME is not responding`.** The runner did not answer
+  `kill` within 10 seconds, or did not exit within 20 seconds after it
+  answered. The message ends with a `pkill` command that stops that runner;
+  run it, then wait a few seconds before you `resume` the job (see `died`).
+- **`flock does not work on ...`.** The state directory is on a file system
+  without working file locks, such as some NFS or SMB mounts. Set
+  `XDG_STATE_HOME` to a directory on a local file system.
+- **`the socket path for this job is too long`.** The socket path under
+  `XDG_STATE_HOME` exceeds the system's limit for Unix sockets (about 100
+  bytes). Set `XDG_STATE_HOME` to a shorter path.
 - **`the job's working directory no longer exists`.** `resume` runs the
   agent in the directory the job was started in. Start a new job instead.
 - **`job ... exists in several projects`.** Run the command from the

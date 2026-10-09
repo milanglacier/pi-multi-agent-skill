@@ -5,6 +5,7 @@ It implements the part of the RPC protocol that multi_agent.py uses. Each test
 sets its behavior through environment variables:
 
 FAKE_PI_RECORD_DIR      Directory for start.jsonl, dialog.jsonl and exit.jsonl.
+                        A start record holds the parent pid, which is the runner's.
 FAKE_PI_REPLY           Final assistant text. Default: "reply to: <prompt> (turn N)".
 FAKE_PI_DELAY           Seconds the run takes before it settles. Default 0.
 FAKE_PI_STOP_REASON     stopReason of the final message. Default "stop".
@@ -167,6 +168,7 @@ def main():
         {
             "argv": argv,
             "env": {k: v for k, v in os.environ.items() if k.startswith(RECORDED_ENV_PREFIXES)},
+            "ppid": os.getppid(),
             "pgid": os.getpgid(0),
             "sid": os.getsid(0),
             "cwd": os.getcwd(),
