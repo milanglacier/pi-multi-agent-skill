@@ -92,7 +92,7 @@ resume` when the job has ended.
 | `aborted` | `abort` stopped the agent. The output is its last message. |
 | `timeout` | The run reached its `--timeout`. The output is the agent's last message. |
 | `killed` | `kill`, a signal to the runner, or the end of a foreground command stopped the job. |
-| `died` | The runner process ended without recording a result, for example after SIGKILL. |
+| `died` | The job's processes ended without recording a result, for example after the runner was killed with SIGKILL. |
 
 ## Profiles
 
@@ -151,8 +151,9 @@ or unset for the user's agent, 1 for an agent it started, and so on. `run` and
   reaches its timeout, or is stopped with `kill`.
 - Each job is run by a separate runner process. Stopping a job through any of
   the paths above lets the agent shut down cleanly. If the runner itself is
-  killed with SIGKILL, the job's status becomes `died` and commands the agent
-  was running may keep running.
+  killed with SIGKILL, the job counts as running until its pi exits too,
+  then its status becomes `died`, and commands the agent was running may
+  keep running.
 
 ## State
 
@@ -170,8 +171,8 @@ list of pi's `/resume`.
 | `system-prompt.md` | The profile's prompt when it replaces pi's system prompt. |
 | `append-prompt.md` | Text added to pi's system prompt: the profile's prompt in append mode, then the multi-agent block. |
 | `status` | Status of the latest run. |
-| `lock` | Held by the job's runner while it runs; a job is running exactly while it is held. |
-| `runner_pid`, `pi_pid` | Process IDs of the latest run. |
+| `lock` | Held for a moment by a command that starts a run, records its end or removes the job, so two such commands never interleave. |
+| `runner_pid`, `pi_pid` | Process IDs of the latest run. The job is running while either process is alive. |
 | `started_at`, `ended_at` | UTC timestamps of the latest run. |
 | `runs` | Number of runs. |
 | `exit_code` | Exit code of the latest run, written last. |
@@ -207,8 +208,10 @@ because two processes would then write the same session file.
 - **A job lingers after its caller is gone.** Background jobs outlive their
   caller by design. Stop them with `kill NAME`, or `kill --all` when the user
   asks.
-- **`job NAME is running` from `resume`.** Another run of the job holds its
-  lock. `wait` for it, or `kill` it first.
+- **`job NAME is running` from `resume`.** The job's runner or its pi is
+  still alive. `wait` for it, or `kill` it first.
+- **`job NAME is busy`.** Another command was starting, killing or removing
+  the job at the same moment. Try again.
 - **`the job's working directory no longer exists`.** `resume` runs the
   agent in the directory the job was started in. Start a new job instead.
 - **`job ... exists in several projects`.** Run the command from the

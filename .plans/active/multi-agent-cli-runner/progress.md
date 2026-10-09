@@ -244,3 +244,18 @@ and the fix summary at the end of review.md.
   `kill` during a `bash` `sleep 6001` took 0.26 s, and pi and the sleep were
   gone; the killed run's output was `(no output)`, not the earlier answer.
   The job and its session were removed afterwards.
+
+## Revision after review, round 2 (2026-10-08)
+
+See "Revision after review, round 2" in plan.md for the decisions and the
+design, and the fix summary at the end of review.md.
+
+- Replaced the run-long lock with a short lock around state changes, and
+  runner liveness with pid and command-line checks of both the runner and
+  pi. Fixed findings 1, 2, 3, 4, 5, 6, 8, 9 and 10.
+- Finding 7 accepted: no backward compatibility with jobs of 7d9fc57. (The
+  pid check happens to recognize their runners anyway, whose command line
+  also starts with `__runner <job dir>`.)
+- Tests: 66 pass with Python 3.14.7 and 3.9, about 95 s. Against c9b3c7b,
+  the new tests for findings 1 and 2 fail. Without `/proc`, `kill` on a pi
+  with a 2 s shutdown now starts 2 `ps`, against 22 with the old polling.

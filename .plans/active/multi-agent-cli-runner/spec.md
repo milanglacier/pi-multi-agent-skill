@@ -161,8 +161,8 @@ timeout_s: 3600
 ### resume
 
 Starts a new run of an existing job on the same pi session, with a new
-prompt. The job must not be running: `resume` takes the job's lock (see
-"Job lock"), so two resumes of one job can never both start a run. It
+prompt. The job must not be running: `resume` checks that under the job's
+lock (see "Job lock"), so two resumes of one job can never both start a run. It
 fails before it changes any state if the job's working directory no longer
 exists. It accepts `--background` and `--timeout` with the same meaning as
 `run`. The profile, model, thinking
@@ -209,7 +209,7 @@ respond.
 
 1. Write the `killed` marker and send SIGTERM to the runner, which stops pi
    (see "Signals and the end of the foreground command").
-2. If the runner still holds the job's lock after 20 seconds, send it
+2. If the runner is still alive after 20 seconds, send it
    SIGKILL. 20 seconds is longer than the runner's own stop sequence for pi
    (10 seconds after closing pi's stdin, then 5 after SIGTERM), so a runner
    that is still stopping pi keeps reading pi's stdout until pi is done.
@@ -217,12 +217,14 @@ respond.
    exits, possibly before it stops the agent's commands (see "Limits").
 3. If pi is still alive 10 seconds later, send SIGKILL to the pid in
    `pi_pid`.
+4. Under the job's lock, record the run as `killed` unless the runner has
+   recorded its end.
 
-`kill` signals the runner and pi by pid, and guards both against a recycled
-pid: the runner's pid only while the job's lock shows the run alive, and
-pi's only while its command line contains the job's `append-prompt.md`
-path. The command line comes from `/proc`, or from `ps` where there is no
-`/proc`. When the job is a foreground run,
+`kill` signals the runner and pi by pid, each only while its command line
+names this job (see "Job lock"), so a recycled pid is never signalled. It
+notes the job's `runs` count when it starts. If another command starts a
+new run meanwhile, `kill` leaves that run alone and does not record it as
+`killed`. When the job is a foreground run,
 the runner records the status `killed`, and the foreground command prints
 the result and exits with code 1.
 
@@ -474,8 +476,7 @@ On `agent_settled` the runner:
    `done` otherwise.
 3. Closes pi's stdin, which makes pi shut down. If pi has not exited after 10
    seconds, the runner sends SIGTERM, and SIGKILL 5 seconds later.
-4. Writes `output.txt`, `exit_code` and `status`, then exits, which
-   releases the job's lock.
+4. Writes `output.txt`, `status` and, last, `exit_code`, then exits.
 
 If pi's stdout reaches end of file before `agent_settled`, the job ends with
 status `failed`, and the last lines of `stderr.txt` are copied into
@@ -622,7 +623,7 @@ once on the pipe's end of file.
 - If the runner itself is killed with SIGKILL (by `kill -9` or the OOM
   killer, not by any harness path), pi sees its stdin close while its stdout
   has no reader, exits on EPIPE, and the commands and background tasks of the
-  agent keep running. `status` reports `died`. This is accepted: nothing in
+  agent keep running. `status` reports `died` once pi has exited. This is accepted: nothing in
   the normal flow sends SIGKILL to a runner, and `kill NAME` sends SIGTERM
   first and waits longer than the runner's whole stop sequence.
 - If the caller's pi is killed with SIGKILL, it cannot stop its commands. A
@@ -668,7 +669,7 @@ name.
 | `append-prompt.md` | Text passed with `--append-system-prompt`: the profile's body in `append` mode, then the multi-agent block. |
 | `status` | `running`, `done`, `failed`, `aborted`, `timeout`, `killed` or `died`. |
 | `lock` | The job's lock (see "Job lock"). |
-| `runner_pid`, `pi_pid` | Process IDs of the current run. |
+| `runner_pid`, `pi_pid` | Process IDs of the current run; the job is running while either is alive. |
 | `started_at`, `ended_at` | UTC timestamps of the current run. |
 | `runs` | Number of runs. |
 | `exit_code` | Exit code of the current run, written last. |
@@ -685,22 +686,38 @@ State files are written through a temporary file and a rename.
 
 ### Job lock
 
-`run` and `resume` take an exclusive `flock` on the job's `lock` file before
-they change any state, and pass the open descriptor to the runner, which
-holds it until it exits. The command closes its own copy as soon as the
-runner has started, also in the foreground. So the lock is held exactly
-while a runner lives, and:
+Whether a job is running is decided by its pids. The job is running while
+its runner or its pi is alive. Each pid counts only while its command line
+names this job: the runner's has `__runner <job dir>`, and pi's has the
+job's `append-prompt.md` path. So a recycled pid cannot pass for either.
+The command line comes from `/proc`, or from `ps` where there is no
+`/proc`. pi counts on its own because it can outlive a runner killed with
+SIGKILL, and a second pi must not start on its session.
 
-- A second `run` or `resume` of the job cannot take the lock and fails with
-  "job NAME is running", so two runners never write one session.
-- A job whose status is `running`, with no `exit_code` for the current run
-  and no one holding the lock, is reported as `died` (or `killed` when the
-  `killed` marker exists). `status`, `wait`, `list` and `kill` apply this
-  check. A recycled runner pid cannot make a dead job look alive, on any
-  system.
+The job's `lock` file serializes changes to the job's state. A command
+takes an exclusive `flock` on it only for a few writes, and nothing holds it
+while a run goes on:
 
-Testing the lock takes a shared lock for a moment, so a `run` or `resume`
-that finds the lock taken tries again for up to a second before it fails.
+- `run` and `resume` check that the job is not running, reset its state,
+  start the runner and write `runner_pid`, all under the lock. A second
+  `run` or `resume` then sees the new runner and fails with "job NAME is
+  running", so two runs never write one session. The runner writes
+  `runner_pid` itself too, in case the command dies before it does.
+- `kill` writes the `killed` marker and reads the pids under the lock, and
+  records the end of the run under it again (see "kill").
+- `rm` checks and deletes the job under the lock. A command that was
+  waiting for the lock then finds the job gone and fails.
+
+A job whose status is `running`, with no `exit_code` for the current run,
+no live runner or pi, and no one holding the lock, is reported as `died`
+(or `killed` when the `killed` marker exists). While another command holds
+the lock, the job counts as running, because that command may be starting
+a run. `status`, `wait`, `list` and `kill` apply this check.
+
+A command that finds the lock taken waits for up to 5 seconds, then fails
+with "job NAME is busy". Where `flock` does not work (some network or FUSE
+file systems), commands go on without the lock, and only concurrent changes
+to one job lose their protection.
 
 If the runner cannot be started, the run is recorded as `failed` with the
 error in `output.txt`, and the command fails with that error.
@@ -725,9 +742,10 @@ SKILL.md tells the agent:
    - Timeouts: a foreground run has none unless `--timeout` is given, and
      stops when its command ends; a background run stops after 3600 seconds
      by default. When a background tool with its own timeout runs the
-     foreground command, pass `--timeout` shorter than the tool's, so the
-     script's timeout decides when the job stops and the job records its
-     status. With the tool's timeout disabled, the job runs until the agent
+     foreground command, pass `--timeout` at least 60 seconds shorter than
+     the tool's, so the script's timeout decides when the job stops and the
+     job records its status. A job can take up to 45 seconds to stop the
+     agent after its timeout. With the tool's timeout disabled, the job runs until the agent
      finishes or the caller's session ends.
    - Use `--background` when there is no such tool, or when the work should
      continue after the caller ends. A background job keeps running until it
@@ -829,8 +847,10 @@ process group, and whether it exited because its stdin closed.
   to the runner), `kill NAME` (also on a foreground run) and `kill --all`.
 - `kill` on a pi whose shutdown takes 12 seconds and ignores SIGTERM: the
   runner keeps reading until pi exits, so pi never hits EPIPE.
-- The job lock: concurrent resumes start one run; `kill` and `status` ignore
-  recycled pids; liveness checks work without `/proc`.
+- The job lock and liveness: concurrent resumes start one run; a resume
+  during `kill` is left running; a pi that outlives its runner keeps the job
+  running; `kill` and `status` ignore recycled pids and a job whose name
+  extends this one's; liveness checks work without `/proc`.
 - The output of a resumed or forked run that ends before its first message
   is empty, not an earlier run's or the caller's text.
 - A resume whose working directory is gone, and a runner that cannot start,

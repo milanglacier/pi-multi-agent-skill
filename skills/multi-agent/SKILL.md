@@ -79,8 +79,9 @@ Keep at most 4 jobs running at once unless the user asks for more.
 - A `--background` job stops after one hour unless you pass `--timeout S`.
   `--timeout 0` removes the limit.
 - When a background tool of your harness runs the foreground command and the
-  tool has its own timeout, pass `--timeout` shorter than the tool's, so the
-  job stops itself and records its result first. If you disable the tool's
+  tool has its own timeout, pass `--timeout` at least 60 seconds shorter
+  than the tool's, so the job stops itself and records its result first.
+  After its timeout, a job can take up to 45 seconds to stop the agent. If you disable the tool's
   timeout instead, the job runs until the agent finishes or your session
   ends.
 

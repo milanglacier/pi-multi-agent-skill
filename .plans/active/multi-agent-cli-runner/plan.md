@@ -4,9 +4,9 @@ The design is in `spec.md` in this directory. This plan covers the order of
 work, what each step produces, and how each step is verified.
 
 Status: steps 1-8 and the revision after step 8 are implemented and
-committed (7d9fc57). The review in `review.md` led to a second revision,
-described at the end of this file. One check from step 8 is still open (see
-"Open items").
+committed (7d9fc57). The review in `review.md` led to a second revision
+(c9b3c7b), and its second round to a third, both described at the end of
+this file. One check from step 8 is still open (see "Open items").
 
 ## Scope
 
@@ -17,7 +17,6 @@ described at the end of this file. One check from step 8 is still open (see
 - `pi-multi-agent-skill/` is a submodule of the monorepo, with its own
   GitHub repo. Replacing pi-subagents in the user's setup is a separate step
   after this plan.
-- Nothing is committed unless the user asks.
 
 ## Step 1: spike the risky assumptions with real pi
 
@@ -258,6 +257,54 @@ real-pi checks show no process left after each path except the accepted one.
   under `kill`, SIGHUP and SIGINT to the runner, output of an early-ended
   resume and fork, concurrent resumes, a resume whose cwd is gone, and
   `kill` with a recycled runner pid.
+
+## Revision after review, round 2
+
+The second part of `review.md` lists ten findings on commit c9b3c7b. Most
+come from the lock being held for a whole run while some code read or wrote
+job state without it, and from the lock covering the runner but not pi. The
+user's decisions:
+
+| # | Finding | Decision |
+|---|---|---|
+| 1 | `kill` can mark a new run as `killed` | Fix, through the short lock |
+| 2 | `resume` can start a second pi while the old one outlives its runner | Fix: a live pi keeps the job running |
+| 3 | `runner_pid` is written after the lock is released | Fix, through the short lock |
+| 4 | "Shorter than the tool's" timeout is not enough | Fix SKILL.md: at least 60 seconds shorter |
+| 5 | `rm` deletes a job without the lock | Fix, through the short lock |
+| 6 | Without working `flock`, `run` fails and jobs read as `died` | Fix: go on without the lock |
+| 7 | Jobs of the previous version cannot be stopped | Accepted: no backward compatibility |
+| 8 | The end of a run is written in three places | Fix: one helper |
+| 9 | The `ps` fallback starts a process on every poll | Fix: check the command line once, then poll the pid |
+| 10 | Stale plan text | Fix |
+
+### Design: a short lock, liveness by pid
+
+- **Liveness.** A job is running while its runner or its pi is alive. Each
+  pid counts only while its command line names the job: `__runner <job
+  dir>` for the runner, the job's `append-prompt.md` path for pi.
+  `process_info` joins the arguments with spaces and ends the command line
+  with a space, so a marker matches whole arguments, and job `foo` does not
+  match the runner of job `foo-2`. This fixes 2.
+- **Short lock.** `job_lock` takes an exclusive `flock` on `<job>/lock` only
+  around state changes: `run` and `resume` check liveness, reset the state,
+  start the runner and write `runner_pid` under it (3); `kill` reads the
+  pids and the `runs` count under it, and records `killed` under it again
+  only if `runs` has not changed and nothing is alive (1); `rm` checks and
+  deletes under it (5). The runner no longer receives the lock, and also
+  writes its own pid. A command that waited for the lock and finds the lock
+  file replaced or gone fails with "job NAME was removed". The lock waits up
+  to `LOCK_TIMEOUT_S` (5 s), then fails with "job NAME is busy".
+- **Readers.** `job_status` counts the job as running while another command
+  holds the lock, because that command may be starting a run.
+- **No flock (6).** When `flock` fails with an error other than
+  `EWOULDBLOCK`, commands go on without the lock.
+- **`process_watch` (9).** Checks a pid's command line once and returns a
+  check that only tests that the pid exists, plus the zombie state where
+  there is `/proc`. `kill` polls the runner and pi with it.
+- **`record_end` (8).** Writes `output.txt` (optional), `ended_at`, `status`
+  and, last, `exit_code`, then the `run N ended` progress line. The runner,
+  the failed runner start and `kill` use it.
 
 ### Open items
 

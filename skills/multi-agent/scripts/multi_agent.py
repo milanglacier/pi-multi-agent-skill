@@ -9,6 +9,7 @@
 # relying on the exec bit.
 
 import calendar
+import contextlib
 import fcntl
 import json
 import os
@@ -57,12 +58,9 @@ PI_TERM_GRACE_S = 5
 # reader during its shutdown.
 RUNNER_STOP_GRACE_S = PI_EXIT_GRACE_S + PI_TERM_GRACE_S + 5
 PI_KILL_GRACE_S = 10
-# A run takes the job's lock before it starts the runner and records the
-# runner's pid right after. `kill` waits this long for the pid.
-START_GRACE_S = 10
-# job_running() holds the lock for a moment while it tests it, so a run that
-# finds the lock taken tries again for this long.
-LOCK_RETRY_S = 1
+# Commands hold the job's lock only for a few state writes (see job_lock), so
+# a command that finds it taken waits this long.
+LOCK_TIMEOUT_S = 5
 RECENT_S = 24 * 3600
 
 EXIT_OK = 0
@@ -184,7 +182,11 @@ def remove(path):
 
 
 def process_info(pid):
-    """(state letter, command line) of pid from /proc, or from ps where there is no /proc; None if unknown."""
+    """(state letter, command line) of pid from /proc, or from ps where there is no /proc; None if unknown.
+
+    The command line has its arguments joined by spaces and ends with a space
+    either way, so a marker can match a whole argument.
+    """
     if os.path.isdir("/proc/self"):
         try:
             with open("/proc/%d/stat" % pid, "rb") as fh:
@@ -193,7 +195,7 @@ def process_info(pid):
                 cmdline = fh.read()
         except OSError:
             return None
-        return stat[stat.rfind(b")") + 2 :][:1], cmdline
+        return stat[stat.rfind(b")") + 2 :][:1], cmdline.replace(b"\0", b" ")
     try:
         out = subprocess.run(
             ["ps", "-ww", "-o", "stat=", "-o", "command=", "-p", str(pid)],
@@ -205,7 +207,7 @@ def process_info(pid):
     fields = out.strip().split(None, 1)
     if not fields:
         return None
-    return fields[0][:1], fields[1] if len(fields) > 1 else b""
+    return fields[0][:1], (fields[1] if len(fields) > 1 else b"") + b" "
 
 
 def process_alive(pid, marker=None):
@@ -226,6 +228,33 @@ def process_alive(pid, marker=None):
     if info is None or info[0] in (b"Z", b"X"):
         return False
     return marker is None or marker in info[1]
+
+
+def process_watch(pid, marker):
+    """A check that stays true while pid is the process marker names; None if it is not that process now.
+
+    A pid cannot be reused while its process lives, so the command line is
+    read once, and later checks only test that pid still exists. Where there
+    is no /proc, that keeps a poll from starting a `ps` each time. A zombie
+    passes the test there, but neither the runner nor pi is a child of the
+    command that polls, so their parent or init reaps them at once.
+    """
+    if not process_alive(pid, marker):
+        return None
+    has_proc = os.path.isdir("/proc/self")
+
+    def alive():
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            # PermissionError means another user's process has the pid now.
+            return False
+        if not has_proc:
+            return True
+        info = process_info(pid)
+        return info is not None and info[0] not in (b"Z", b"X")
+
+    return alive
 
 
 def wait_while(check, timeout):
@@ -518,29 +547,52 @@ def job_path(job_dir, name):
     return os.path.join(job_dir, name)
 
 
-def lock_job(job_dir):
-    """Take the job's lock and return its descriptor, or None while a run holds it.
+@contextlib.contextmanager
+def job_lock(job_dir):
+    """Hold the job's lock while changing its state.
 
-    The lock is an flock on the file `lock`. A run takes it before it changes
-    any state and hands the descriptor to its runner, which holds it until it
-    exits. So a job is running exactly while its lock is held, and a recycled
-    pid cannot pass for a runner.
+    The lock is an flock on the file `lock`. A command holds it only for a
+    few writes: starting a run, recording a run's end from outside its
+    runner, or removing the job. So two such changes never interleave, and
+    each one sees the state the last one left. Nothing holds the lock while a
+    run goes on; whether a job is running is decided by its pids (see
+    job_running).
     """
-    fd = os.open(job_path(job_dir, "lock"), os.O_RDWR | os.O_CREAT, 0o644)
-    end = time.monotonic() + LOCK_RETRY_S
-    while True:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return fd
-        except BlockingIOError:
-            if time.monotonic() >= end:
-                os.close(fd)
-                return None
-            time.sleep(0.05)
+    name = os.path.basename(job_dir)
+    path = job_path(job_dir, "lock")
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    except FileNotFoundError:
+        raise CommandError("job %s was removed" % name)
+    try:
+        end = time.monotonic() + LOCK_TIMEOUT_S
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                if time.monotonic() >= end:
+                    raise CommandError("job %s is busy: another command is changing it; try again" % name)
+                time.sleep(0.05)
+                continue
+            except OSError:
+                # flock does not work on this file system (some network or
+                # FUSE mounts). Go on without it: only concurrent changes to
+                # one job lose their protection.
+                break
+            # `rm` may have removed the job while this command waited.
+            try:
+                if os.stat(path).st_ino != os.fstat(fd).st_ino:
+                    raise CommandError("job %s was removed" % name)
+            except FileNotFoundError:
+                raise CommandError("job %s was removed" % name)
+            break
+        yield
+    finally:
+        os.close(fd)
 
 
-def job_running(job_dir):
-    """Whether a run holds the job's lock."""
+def lock_held(job_dir):
+    """Whether another command holds the job's lock (see job_lock)."""
     try:
         fd = os.open(job_path(job_dir, "lock"), os.O_RDONLY)
     except OSError:
@@ -556,12 +608,38 @@ def job_running(job_dir):
     return False
 
 
-def job_status(job_dir):
-    """The job's status, with `died` (or `killed`) for a runner that vanished."""
+def runner_marker(job_dir):
+    return os.fsencode("__runner %s " % job_dir)
+
+
+def pi_marker(job_dir):
+    return os.fsencode(job_path(job_dir, "append-prompt.md") + " ")
+
+
+def job_running(job_dir):
+    """Whether the job's runner or its pi is alive.
+
+    Each pid counts only while its command line names this job, so a
+    recycled pid cannot pass for either. pi counts on its own because it can
+    outlive a runner that was SIGKILLed, and a second pi must not start on
+    its session.
+    """
+    if process_alive(read_int(job_path(job_dir, "runner_pid")), runner_marker(job_dir)):
+        return True
+    return process_alive(read_int(job_path(job_dir, "pi_pid")), pi_marker(job_dir))
+
+
+def job_status(job_dir, locked=False):
+    """The job's status, with `died` (or `killed`) for a run whose processes are gone.
+
+    A command that holds the job's lock may be starting a run or recording
+    its end, so the job counts as running meanwhile. Pass locked=True when
+    this process holds the lock itself.
+    """
     status = (read_text(job_path(job_dir, "status"), "") or "").strip() or "unknown"
     if status != "running" or os.path.exists(job_path(job_dir, "exit_code")):
         return status
-    if job_running(job_dir):
+    if job_running(job_dir) or (not locked and lock_held(job_dir)):
         return "running"
     return "killed" if os.path.exists(job_path(job_dir, "killed")) else "died"
 
@@ -638,6 +716,21 @@ def append_progress(job_dir, message):
         pass
 
 
+def record_end(job_dir, status, output=None, detail=None):
+    """Record the end of the job's current run; output None keeps output.txt.
+
+    exit_code is written last: once it exists, readers trust the status
+    file and the rest of the run's state.
+    """
+    if output is not None:
+        write_atomic(job_path(job_dir, "output.txt"), output + ("\n" if output else ""))
+    write_atomic(job_path(job_dir, "ended_at"), utcnow() + "\n")
+    write_atomic(job_path(job_dir, "status"), status + "\n")
+    write_atomic(job_path(job_dir, "exit_code"), "%d\n" % (EXIT_OK if status == "done" else EXIT_FAIL))
+    message = "run %s ended: %s" % (read_int(job_path(job_dir, "runs")), status)
+    append_progress(job_dir, message + (" (%s)" % detail if detail else ""))
+
+
 # --- runner ------------------------------------------------------------------
 
 
@@ -674,16 +767,13 @@ def short_args(args):
 class Runner:
     """Owns one pi RPC process for one run of a job.
 
-    lock_fd holds the job's lock (see lock_job) for as long as the runner
-    lives. caller_fd is the read end of a pipe whose only write end the
-    foreground `run` process holds. End of file on it means that process has
-    ended, for any reason, SIGKILL included, and the run stops.
+    caller_fd is the read end of a pipe whose only write end the foreground
+    `run` process holds. End of file on it means that process has ended, for
+    any reason, SIGKILL included, and the run stops.
     """
 
-    def __init__(self, job_dir, lock_fd, caller_fd=None):
+    def __init__(self, job_dir, caller_fd=None):
         self.job_dir = job_dir
-        self.lock_fd = lock_fd
-        os.set_inheritable(lock_fd, False)
         self.job = read_json(job_path(job_dir, "job.json"))
         self.prompt = read_text(job_path(job_dir, "prompt.txt"), "")
         self.caller_fd = caller_fd
@@ -950,6 +1040,8 @@ class Runner:
     # -- the run --
 
     def run(self):
+        # The starting command records this pid too, but it may die before it does.
+        write_atomic(job_path(self.job_dir, "runner_pid"), "%d\n" % os.getpid())
         self.install_signals()
         self.watch_caller()
         try:
@@ -1053,15 +1145,10 @@ class Runner:
 
     def conclude(self, status, output):
         self.finishing = True
-        write_atomic(job_path(self.job_dir, "output.txt"), output + ("\n" if output else ""))
         write_atomic(job_path(self.job_dir, "usage.json"), json.dumps(self.usage, indent=2) + "\n")
         if self.model_used:
             write_atomic(job_path(self.job_dir, "model"), self.model_used + "\n")
-        write_atomic(job_path(self.job_dir, "ended_at"), utcnow() + "\n")
-        write_atomic(job_path(self.job_dir, "status"), status + "\n")
-        code = EXIT_OK if status == "done" else EXIT_FAIL
-        write_atomic(job_path(self.job_dir, "exit_code"), "%d\n" % code)
-        self.progress("run %s ended: %s" % (read_int(job_path(self.job_dir, "runs")), status))
+        record_end(self.job_dir, status, output)
         return status
 
     def emergency_stop(self):
@@ -1078,9 +1165,9 @@ def format_seconds(value):
     return ("%g" % value) if value is not None else "none"
 
 
-def run_runner(job_dir, lock_fd, caller_fd=None):
+def run_runner(job_dir, caller_fd=None):
     """Run one job run to completion and return its final status."""
-    runner = Runner(job_dir, lock_fd, caller_fd)
+    runner = Runner(job_dir, caller_fd)
     try:
         return runner.run()
     except Exception:
@@ -1124,16 +1211,13 @@ def start_run(job_dir, job, prompt, background, timeout, run_kind):
     stays as the runner's caller: it waits for the runner, prints the result,
     and holds the write end of the pipe whose end of file stops the run.
     """
-    lock_fd = lock_job(job_dir)
-    if lock_fd is None:
-        raise CommandError("job %s is running; use steer, or wait for it to finish" % job["name"])
-    try:
-        proc, caller_w = start_runner(job_dir, job, lock_fd, prompt, background, timeout, run_kind)
-    finally:
-        # From here on only the runner holds the lock, so the job stops
-        # counting as running when the runner ends, even if this process stays.
-        os.close(lock_fd)
-    write_atomic(job_path(job_dir, "runner_pid"), "%d\n" % proc.pid)
+    with job_lock(job_dir):
+        if job_status(job_dir, locked=True) == "running":
+            raise CommandError("job %s is running; use steer, or wait for it to finish" % job["name"])
+        proc, caller_w = start_runner(job_dir, job, prompt, background, timeout, run_kind)
+        # Recorded before the lock is released, so the next command that
+        # takes it sees the run as running.
+        write_atomic(job_path(job_dir, "runner_pid"), "%d\n" % proc.pid)
     if background:
         sys.stdout.write("job: %s\nstatus: running\ntimeout_s: %s\n" % (job["name"], format_seconds(timeout)))
         return EXIT_OK
@@ -1141,7 +1225,7 @@ def start_run(job_dir, job, prompt, background, timeout, run_kind):
     return follow_runner(job_dir, proc, caller_w)
 
 
-def start_runner(job_dir, job, lock_fd, prompt, background, timeout, run_kind):
+def start_runner(job_dir, job, prompt, background, timeout, run_kind):
     """Reset the job's state for a new run and start the runner; return it and the caller's pipe end.
 
     Called with the job's lock held. If the runner cannot start, the run is
@@ -1164,8 +1248,9 @@ def start_runner(job_dir, job, lock_fd, prompt, background, timeout, run_kind):
     write_atomic(job_path(job_dir, "started_at"), utcnow() + "\n")
     write_atomic(job_path(job_dir, "status"), "running\n")
 
-    argv = [sys.executable, SCRIPT_PATH, "__runner", job_dir, str(lock_fd)]
-    pass_fds = [lock_fd]
+    # The job directory follows `__runner` so that runner_marker() matches.
+    argv = [sys.executable, SCRIPT_PATH, "__runner", job_dir]
+    pass_fds = []
     caller_r = caller_w = None
     if not background:
         # os.pipe() descriptors are not inherited, so only the runner gets
@@ -1192,11 +1277,7 @@ def start_runner(job_dir, job, lock_fd, prompt, background, timeout, run_kind):
             if fd is not None:
                 os.close(fd)
         message = "could not start the runner: %s" % exc
-        write_atomic(job_path(job_dir, "output.txt"), "error: %s\n" % message)
-        write_atomic(job_path(job_dir, "ended_at"), utcnow() + "\n")
-        write_atomic(job_path(job_dir, "status"), "failed\n")
-        write_atomic(job_path(job_dir, "exit_code"), "%d\n" % EXIT_FAIL)
-        append_progress(job_dir, "run %d ended: failed (%s)" % (runs, message))
+        record_end(job_dir, "failed", "error: " + message, message)
         raise CommandError(message)
     if caller_r is not None:
         os.close(caller_r)
@@ -1229,11 +1310,10 @@ def follow_runner(job_dir, proc, caller_w):
 
 
 def cmd_runner(argv):
-    """Internal: the detached runner of a run, holding the job's lock. A foreground run passes the caller's pipe."""
+    """Internal: the detached runner of a run. A foreground run passes the caller's pipe."""
     job_dir = argv[0]
-    lock_fd = int(argv[1])
-    caller_fd = int(argv[2]) if len(argv) > 2 else None
-    run_runner(job_dir, lock_fd, caller_fd)
+    caller_fd = int(argv[1]) if len(argv) > 1 else None
+    run_runner(job_dir, caller_fd)
     return EXIT_OK
 
 
@@ -1487,43 +1567,47 @@ def cmd_abort(argv):
 def kill_job(job_dir):
     """Stop one job by pid: the runner first, then pi if it outlives the runner.
 
-    The runner's pid is signalled only while the job's lock shows the run
-    alive, and pi's only while its command line names this job's prompt
-    file, so a recycled pid is never signalled.
+    Each pid is signalled only while its command line names this job, so a
+    recycled pid is never signalled. A run that another command starts
+    meanwhile is left alone, and is not recorded as killed.
     """
     name = os.path.basename(job_dir)
-    status = job_status(job_dir)
-    if status != "running":
-        return "job: %s\nstatus: %s (not running)\n" % (name, status)
-    write_atomic(job_path(job_dir, "killed"), "")
-    runner = read_int(job_path(job_dir, "runner_pid"))
-    end = time.monotonic() + START_GRACE_S
-    while runner is None and job_running(job_dir) and time.monotonic() < end:
-        time.sleep(0.1)
+    with job_lock(job_dir):
+        status = job_status(job_dir, locked=True)
+        if status != "running":
+            return "job: %s\nstatus: %s (not running)\n" % (name, status)
+        write_atomic(job_path(job_dir, "killed"), "")
+        run = read_int(job_path(job_dir, "runs"))
         runner = read_int(job_path(job_dir, "runner_pid"))
-    if runner is not None and job_running(job_dir):
+
+    def same_run():
+        return read_int(job_path(job_dir, "runs")) == run
+
+    runner_alive = process_watch(runner, runner_marker(job_dir))
+    if runner_alive:
         try:
             os.kill(runner, signal.SIGTERM)
         except OSError:
             pass
-        if not wait_while(lambda: job_running(job_dir), RUNNER_STOP_GRACE_S):
+        if not wait_while(runner_alive, RUNNER_STOP_GRACE_S):
             try:
                 os.kill(runner, signal.SIGKILL)
             except OSError:
                 pass
-            wait_while(lambda: job_running(job_dir), 2)
-    pi_pid = read_int(job_path(job_dir, "pi_pid"))
-    pi_marker = job_path(job_dir, "append-prompt.md").encode()
-    if pi_pid is not None and not wait_while(lambda: process_alive(pi_pid, pi_marker), PI_KILL_GRACE_S):
-        try:
-            os.kill(pi_pid, signal.SIGKILL)
-        except OSError:
-            pass
-    if not os.path.exists(job_path(job_dir, "exit_code")):
-        write_atomic(job_path(job_dir, "ended_at"), utcnow() + "\n")
-        write_atomic(job_path(job_dir, "status"), "killed\n")
-        write_atomic(job_path(job_dir, "exit_code"), "%d\n" % EXIT_FAIL)
-        append_progress(job_dir, "killed")
+            wait_while(runner_alive, 2)
+    if same_run():
+        # The runner wrote pi_pid, so it is final once the runner is gone.
+        pi_pid = read_int(job_path(job_dir, "pi_pid"))
+        pi_alive = process_watch(pi_pid, pi_marker(job_dir))
+        if pi_alive and not wait_while(pi_alive, PI_KILL_GRACE_S):
+            try:
+                os.kill(pi_pid, signal.SIGKILL)
+            except OSError:
+                pass
+            wait_while(pi_alive, 2)
+    with job_lock(job_dir):
+        if same_run() and job_status(job_dir, locked=True) in ("killed", "died"):
+            record_end(job_dir, "killed")
     return "job: %s\nstatus: %s\n" % (name, job_status(job_dir))
 
 
@@ -1548,7 +1632,10 @@ def cmd_kill(argv):
         results = {}
 
         def kill_one(job_dir):
-            results[job_dir] = kill_job(job_dir)
+            try:
+                results[job_dir] = kill_job(job_dir)
+            except CommandError as exc:
+                results[job_dir] = "job: %s\nerror: %s\n" % (os.path.basename(job_dir), exc)
 
         threads = [threading.Thread(target=kill_one, args=(d,)) for d in running]
         for thread in threads:
@@ -1667,12 +1754,13 @@ def cmd_profiles(argv):
 def cmd_rm(argv):
     job_dir = find_job(one_name(Args(argv, (), ()), "rm"))
     name = os.path.basename(job_dir)
-    if job_status(job_dir) == "running":
-        raise CommandError("job %s is running; kill it first" % name)
-    job = read_json(job_path(job_dir, "job.json"), {})
-    for path in find_session_file(job.get("session_dir", ""), name):
-        remove(path)
-    shutil.rmtree(job_dir, ignore_errors=True)
+    with job_lock(job_dir):
+        if job_status(job_dir, locked=True) == "running":
+            raise CommandError("job %s is running; kill it first" % name)
+        job = read_json(job_path(job_dir, "job.json"), {})
+        for path in find_session_file(job.get("session_dir", ""), name):
+            remove(path)
+        shutil.rmtree(job_dir, ignore_errors=True)
     sys.stdout.write("removed: %s\n" % name)
     return EXIT_OK
 
