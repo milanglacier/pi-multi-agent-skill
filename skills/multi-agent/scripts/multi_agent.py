@@ -2,8 +2,8 @@
 # multi_agent.py - start pi agents as separate `pi --mode rpc` processes and
 # manage each one as a named job.
 #
-# ../SKILL.md explains how an agent uses this script and ../reference.md lists
-# every command, option and state file.
+# ../SKILL.md explains how an agent uses this script; ../references/ describes
+# every command, option, status and state file.
 #
 # Stdlib only, Python 3.9+. Invoke as `python3 multi_agent.py ...` rather than
 # relying on the exec bit.
@@ -104,7 +104,7 @@ Options for run:
   --thinking L    Thinking level passed to `pi --thinking`
   --cwd DIR       Working directory for the agent (default: the current directory)
 
-A PROMPT or MESSAGE of `-` is read from stdin. See reference.md for details."""
+A PROMPT or MESSAGE of `-` is read from stdin. See references/commands.md for details."""
 
 
 class CommandError(Exception):

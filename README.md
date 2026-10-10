@@ -38,9 +38,9 @@ Two profiles ship with the skill: `general-purpose`, which behaves like the
 caller's own pi, and `Explore`, a read-only search agent. Profiles in
 `~/.pi/agent/agents/` and `<project>/.pi/agents/` replace them or add more.
 
-See [`skills/multi-agent/reference.md`](skills/multi-agent/reference.md) for
-every command and option, the profile format, the state layout and
-troubleshooting.
+See [`skills/multi-agent/references/`](skills/multi-agent/references/) for
+every command and option, the job lifecycle, the profile format, the state
+layout and troubleshooting.
 
 ## Tests
 

@@ -32,7 +32,8 @@ python3 "$SKILL_DIR/scripts/multi_agent.py" profiles
 ```
 
 `general-purpose` (the default) has your tools and settings. `Explore` is a
-read-only search agent. Pass the profile with `--profile NAME`.
+read-only search agent. Pass the profile with `--profile NAME`. To write
+your own profile, see `references/profiles.md`.
 
 ## Run an agent
 
@@ -129,5 +130,18 @@ python3 "$SKILL_DIR/scripts/multi_agent.py" status NAME
 python3 "$SKILL_DIR/scripts/multi_agent.py" peek NAME
 ```
 
-`peek` shows the job's recent tool calls. For every option, the status values,
-where state is kept and troubleshooting, see `reference.md` in this directory.
+`peek` shows the job's recent tool calls.
+
+## References
+
+The `references/` directory next to this file has the details. Read a file
+only when you need it:
+
+- `commands.md`: every command and option, output formats and exit codes.
+- `lifecycle.md`: statuses, how a run stops, foreground and background
+  lifetime, timeouts, dialogs and nesting.
+- `profiles.md`: writing a profile, where profiles are looked up, and how the
+  model, tools and system prompt are chosen.
+- `state.md`: where jobs and conversations are stored, and the agent's
+  environment.
+- `troubleshooting.md`: error messages and what to do about them.
