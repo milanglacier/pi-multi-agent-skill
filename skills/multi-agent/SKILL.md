@@ -1,6 +1,6 @@
 ---
 name: multi-agent
-description: Start other pi agents as separate processes to work on tasks in parallel or in the background, then wait for, steer, stop, or resume them. Use it for independent research, broad codebase searches, and parallel work whose intermediate output should stay out of your context. Do not use it for small tasks you can do directly.
+description: Delegate work to other agents. Use it when a task benefits from a multi-agent workflow, such as splitting work across agents, running it in parallel or in the background, or keeping a side task out of your own context.
 ---
 
 # Multi-agent
