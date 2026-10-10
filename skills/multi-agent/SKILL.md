@@ -70,7 +70,7 @@ For a long task, or several tasks in parallel:
   default). Tell the user the job's name.
 - Never put the command in the background with `&`; use `--background`.
 
-Keep at most 4 jobs running at once unless the user asks for more.
+Run only as many jobs at once as the task needs.
 
 ## Timeouts
 
@@ -80,11 +80,10 @@ Keep at most 4 jobs running at once unless the user asks for more.
 - A `--background` job stops after one hour unless you pass `--timeout S`.
   `--timeout 0` removes the limit.
 - When a background tool of your harness runs the foreground command and the
-  tool has its own timeout, pass `--timeout` at least 60 seconds shorter
-  than the tool's, so the job stops itself and records its result first.
-  After its timeout, a job can take up to 45 seconds to stop the agent. If you disable the tool's
-  timeout instead, the job runs until the agent finishes or your session
-  ends.
+  tool has its own timeout, pass a shorter `--timeout`, leaving a grace
+  period so the job stops the agent and records its result before the tool
+  kills it. If you disable the tool's timeout instead, the job runs until
+  the agent finishes or your session ends.
 
 ## Wait for a result
 
