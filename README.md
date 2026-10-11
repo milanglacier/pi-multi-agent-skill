@@ -32,9 +32,6 @@ resumes them. Any harness or agent that has a shell can use it.
   agent's system prompt, model, thinking level and tools.
 - **Fork your conversation.** `--fork` hands the agent everything you have
   discussed so far, for tasks that need that context.
-- **No hanging on prompts.** Agents never wait on a question nobody can
-  answer. A blocked approval comes back in the agent's result, so you can run
-  that step yourself.
 - **Works outside pi.** Claude Code, Codex or any other agent with a shell
   can run the same commands to delegate work to pi agents.
 
