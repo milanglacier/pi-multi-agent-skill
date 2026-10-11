@@ -17,3 +17,4 @@ htmlcov/
 *.swp
 *.swo
 *~
+.tags
