@@ -23,6 +23,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SCRIPT = os.path.join(ROOT, "skills", "multi-agent", "scripts", "multi_agent.py")
 FAKE_PI = os.path.join(HERE, "fake-pi")
+# Scales the script's timeouts and grace periods, in the commands the tests
+# run and in `ma` below, so tests that wait them out stay short. Tests compute
+# their expectations from the scaled constants, such as ma.PI_EXIT_GRACE_S.
+TIME_SCALE = "0.1"
+os.environ["MULTI_AGENT_TIME_SCALE"] = TIME_SCALE
 
 _spec = importlib.util.spec_from_file_location("multi_agent", SCRIPT)
 ma = importlib.util.module_from_spec(_spec)
@@ -84,6 +89,7 @@ class Base(unittest.TestCase):
                 "XDG_STATE_HOME": os.path.join(self.tmp, "state"),
                 "PI_CODING_AGENT_DIR": self.agent_dir,
                 "MULTI_AGENT_PI_BIN": FAKE_PI,
+                "MULTI_AGENT_TIME_SCALE": TIME_SCALE,
                 "FAKE_PI_RECORD_DIR": self.record,
                 "PWD": self.project,
                 "HERDR_ENV": "1",
@@ -155,6 +161,15 @@ class Base(unittest.TestCase):
 
     def exit_reasons(self):
         return [r["reason"] for r in self.records("exit")]
+
+    def hold(self):
+        """Return env that keeps fake-pi's run from settling, and a function that lets it settle."""
+        path = tempfile.mktemp(prefix="release-", dir=self.tmp)
+
+        def release():
+            open(path, "w").close()
+
+        return {"FAKE_PI_HOLD": path}, release
 
     def run_bg(self, name, prompt="task", env=None, extra=()):
         result = self.cli("run", "--background", "--name", name, *extra, prompt, env=env)
@@ -562,23 +577,25 @@ class ForegroundTest(Base):
 
     def test_timeout(self):
         start = time.monotonic()
-        result = self.cli("run", "--name", "slow", "--timeout", "1", "x", env={"FAKE_PI_DELAY": "30"})
+        result = self.cli("run", "--name", "slow", "--timeout", "0.2", "x", env={"FAKE_PI_DELAY": "30"})
         self.assertLess(time.monotonic() - start, 15)
         self.assertEqual(result.returncode, 1)
         self.assertIn("status: timeout", result.stdout)
         self.assertIn("reply to: x (turn 1)", result.stdout)
-        self.assertIn("timeout after 1s", self.state("slow", "progress.log"))
+        self.assertIn("timeout after 0.2s", self.state("slow", "progress.log"))
 
     @unittest.skipUnless(os.path.isdir("/proc/self"), "needs /proc")
     def test_timeout_when_pi_does_not_settle(self):
         env = {"FAKE_PI_DELAY": "120", "FAKE_PI_IGNORE_ABORT": "1"}
-        self.run_bg("unsettled", env=env, extra=("--timeout", "1"))
+        self.run_bg("unsettled", env=env, extra=("--timeout", "0.2"))
         runner = self.runner_pid()
-        wait_until(lambda: "timeout after 1s" in self.state("unsettled", "progress.log"))
-        # The runner waits for pi to settle without spinning.
+        wait_until(lambda: "timeout after 0.2s" in self.state("unsettled", "progress.log"))
+        # The runner waits for pi to settle without spinning. The sample ends
+        # well before SETTLE_TIMEOUT_S, while the runner still exists.
+        self.assertGreater(ma.SETTLE_TIMEOUT_S, 2)
         before = cpu_seconds(runner)
-        time.sleep(3)
-        self.assertLess(cpu_seconds(runner) - before, 0.5)
+        time.sleep(1)
+        self.assertLess(cpu_seconds(runner) - before, 0.2)
         result = self.cli("wait", "unsettled", "--timeout", "45")
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn("status: timeout", result.stdout)
@@ -618,7 +635,8 @@ class ForegroundTest(Base):
             self.assertIn("stopped: the caller's command ended", self.state(name, "progress.log"))
 
     def test_runner_is_detached_from_the_caller(self):
-        proc = self.popen("run", "--name", "detached", "x", env={"FAKE_PI_DELAY": "2"})
+        hold, release = self.hold()
+        proc = self.popen("run", "--name", "detached", "x", env=hold)
         start = self.start_record()
         runner = start["ppid"]
         self.assertNotEqual(runner, proc.pid)
@@ -627,6 +645,7 @@ class ForegroundTest(Base):
         self.assertEqual(os.getsid(runner), runner)
         self.assertNotEqual(os.getsid(runner), os.getsid(proc.pid))
         self.assertNotIn(start["sid"], (os.getsid(0), os.getsid(proc.pid), runner))
+        release()
         proc.communicate(timeout=30)
         self.assertEqual(proc.returncode, 0)
 
@@ -677,7 +696,8 @@ class ForegroundTest(Base):
 
 class BackgroundTest(Base):
     def test_detach_wait_and_result(self):
-        result = self.run_bg("bg1", env={"FAKE_PI_DELAY": "2"})
+        hold, release = self.hold()
+        result = self.run_bg("bg1", env=hold)
         self.assertEqual(result.stdout, "job: bg1\nstatus: running\ntimeout_s: 3600\n")
         self.assertIn("status: running", self.cli("status", "bg1").stdout)
         running = self.cli("result", "bg1")
@@ -686,6 +706,7 @@ class BackgroundTest(Base):
         waited = self.cli("wait", "bg1", "--timeout", "0.2")
         self.assertEqual(waited.returncode, 2)
         self.assertIn("status: running", waited.stdout)
+        release()
         done = self.cli("wait", "bg1")
         self.assertEqual(done.returncode, 0)
         self.assertIn("reply to: task (turn 1)", done.stdout)
@@ -695,10 +716,11 @@ class BackgroundTest(Base):
 
     def test_survives_the_callers_exit(self):
         # The caller runs in its own process group, which is then killed.
+        hold, release = self.hold()
         caller = subprocess.Popen(
             [sys.executable, SCRIPT, "run", "--background", "--name", "orphan", "x"],
             cwd=self.project,
-            env=dict(self.env, FAKE_PI_DELAY="2"),
+            env=dict(self.env, **hold),
             stdout=subprocess.PIPE,
             start_new_session=True,
         )
@@ -708,6 +730,7 @@ class BackgroundTest(Base):
         except OSError:
             pass
         self.assertTrue(alive(self.runner_pid()))
+        release()
         result = self.cli("wait", "orphan")
         self.assertEqual(result.returncode, 0)
         self.assertIn("status: done", result.stdout)
@@ -718,12 +741,14 @@ class BackgroundTest(Base):
         self.cli("wait", "t0")
 
     def test_steer_and_not_running(self):
-        self.run_bg("st", env={"FAKE_PI_DELAY": "3"})
+        hold, release = self.hold()
+        self.run_bg("st", env=hold)
         # Sent at once: the runner is still starting, and the request waits
         # in the socket's listen backlog until the runner accepts it.
         steer = self.cli("steer", "st", "-", input="look at Y too\n")
         self.assertEqual(steer.returncode, 0, steer.stderr)
         self.assertEqual(steer.stdout, "job: st\nsteer: queued\n")
+        release()
         result = self.cli("wait", "st")
         self.assertIn("| steered: look at Y too", result.stdout)
         self.assertIn("steer: look at Y too", self.state("st", "progress.log"))
@@ -800,7 +825,8 @@ class BackgroundTest(Base):
         self.cli("wait", "starting")
         job_dir = self.job_dir("starting")
         for turn in range(2, 5):
-            proc = self.popen("resume", "starting", "--background", "again", env={"FAKE_PI_DELAY": "0.5"})
+            hold, release = self.hold()
+            proc = self.popen("resume", "starting", "--background", "again", env=hold)
             states = set()
             while proc.poll() is None or len(self.records("start")) < turn:
                 states.add(ma.job_state(job_dir))
@@ -808,6 +834,7 @@ class BackgroundTest(Base):
             _out, err = proc.communicate()
             self.assertEqual(proc.returncode, 0, err)
             self.assertIn("starting", self.cli("list").stdout)
+            release()
             self.assertIn("reply to: again (turn %d)" % turn, self.cli("wait", "starting").stdout)
             self.assertLessEqual(states, {"done", "running"})
 
@@ -944,10 +971,12 @@ class KillTest(Base):
             self.assertIn("job is not running; use resume", result.stderr)
         self.assertEqual(self.cli("kill", "sk").stdout, "job: sk\nstatus: died (not running)\n")
         # resume binds over the leftover socket file.
-        result = self.cli("resume", "sk", "--background", "again", env={"FAKE_PI_DELAY": "3"})
+        hold, release = self.hold()
+        result = self.cli("resume", "sk", "--background", "again", env=hold)
         self.assertEqual(result.returncode, 0, result.stderr)
         steer = self.cli("steer", "sk", "and this")
         self.assertEqual(steer.stdout, "job: sk\nsteer: queued\n", steer.stderr)
+        release()
         result = self.cli("wait", "sk")
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn("reply to: again (turn 2) | steered: and this", result.stdout)
@@ -959,7 +988,7 @@ class KillTest(Base):
         result = self.cli("rm", "rm-busy")
         self.assertEqual(result.returncode, 1)
         self.assertIn("job rm-busy is running; kill it first", result.stderr)
-        self.assertLess(time.monotonic() - start, 10)
+        self.assertLess(time.monotonic() - start, 2 * ma.LOCK_TIMEOUT_S)
         self.assertIn("status: running", self.cli("status", "rm-busy").stdout)
         self.cli("kill", "rm-busy")
 
@@ -976,7 +1005,7 @@ class KillTest(Base):
         os.kill(runner, signal.SIGSTOP)
         start = time.monotonic()
         result = self.cli("kill", "stuck")
-        self.assertLess(time.monotonic() - start, 15)
+        self.assertLess(time.monotonic() - start, 1.5 * ma.ACK_TIMEOUT_S)
         self.assertEqual(result.returncode, 1)
         self.assertIn("the runner of job stuck is not responding; to stop it, run: pkill -KILL -f ", result.stderr)
         self.assertIn("status: running", self.cli("status", "stuck").stdout)
@@ -999,14 +1028,16 @@ class KillTest(Base):
             self.assertIn("stopped by %s" % signal.Signals(signum).name, self.state(name, "progress.log"))
 
     def test_kill_waits_for_a_slow_shutdown(self):
-        # pi takes 12 s to shut down and ignores SIGTERM. kill must not take
-        # the reader of pi's stdout away before pi has finished.
-        env = {"FAKE_PI_DELAY": "60", "FAKE_PI_SLOW_EXIT": "12", "FAKE_PI_IGNORE_SIGTERM": "1"}
+        # pi's shutdown outlasts PI_EXIT_GRACE_S, and pi ignores SIGTERM, so
+        # it ends before the SIGKILL only if kill keeps reading its stdout.
+        # kill must not take that reader away before pi has finished.
+        slow_exit = ma.PI_EXIT_GRACE_S + ma.PI_TERM_GRACE_S / 2
+        env = {"FAKE_PI_DELAY": "60", "FAKE_PI_SLOW_EXIT": str(slow_exit), "FAKE_PI_IGNORE_SIGTERM": "1"}
         self.run_bg("slow-exit", env=env)
         pi_pid = self.start_record()["pid"]
         start = time.monotonic()
         result = self.cli("kill", "slow-exit", timeout=60)
-        self.assertGreater(time.monotonic() - start, 11)
+        self.assertGreater(time.monotonic() - start, ma.PI_EXIT_GRACE_S)
         self.assertEqual(result.stdout, "job: slow-exit\nstatus: killed\n")
         self.assertTrue(pid_gone(pi_pid))
         self.assertEqual(self.records("exit")[-1], {"reason": "stdin_closed", "pid": pi_pid})

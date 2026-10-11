@@ -405,6 +405,11 @@ pi --mode rpc --session-dir <session dir> <session args> <profile args> \
   "Lifetime".
 - `MULTI_AGENT_PI_BIN` overrides the `pi` executable. Tests use it to run
   `tests/fake-pi`.
+- `MULTI_AGENT_TIME_SCALE` (a positive number, default 1) multiplies the
+  script's timing constants: the ack, settle and lock timeouts, the grace
+  periods for stopping pi and the runner, and `wait`'s poll interval. Run
+  timeouts (`--timeout` and the background default) are not scaled. Tests
+  set it to 0.1 so that the tests which wait out these timeouts stay short.
 
 The child environment is the runner's environment with these changes:
 
@@ -815,9 +820,14 @@ way therefore ends with the caller's session, and its runner stops the job
 
 `tests/fake-pi` is an offline stand-in for `pi --mode rpc`. Its behavior is
 set by environment variables in each test: reply text, delay before
-settling, stop reason, a dialog request to emit, exiting early, ignoring
-SIGTERM. It records the arguments and environment it was started with, its
+settling, a file whose creation lets the run settle, stop reason, a dialog
+request to emit, exiting early, ignoring SIGTERM. It records the arguments and environment it was started with, its
 process group, and whether it exited because its stdin closed.
+
+The tests run with `MULTI_AGENT_TIME_SCALE=0.1` and compute their expected
+durations from the scaled constants. A test that needs a run to stay alive
+while it acts on it holds the run with that file and releases it afterwards,
+instead of guessing a delay.
 
 `tests/test_multi_agent.py` covers:
 
@@ -845,8 +855,9 @@ process group, and whether it exited because its stdin closed.
   `timeout` after the settle deadline.
 - Signal handling (SIGTERM, SIGHUP and SIGINT to the foreground command and
   to the runner), `kill NAME` (also on a foreground run) and `kill --all`.
-- `kill` on a pi whose shutdown takes 12 seconds and ignores SIGTERM: the
-  runner keeps reading until pi exits, so pi never hits EPIPE.
+- `kill` on a pi whose shutdown outlasts the exit grace period and that
+  ignores SIGTERM: the runner keeps reading until pi exits, so pi never hits
+  EPIPE.
 - The job lock and liveness: concurrent resumes start one run; a resume
   during `kill` is left running; a pi that outlives its runner keeps the job
   running; `kill` and `status` ignore recycled pids and a job whose name

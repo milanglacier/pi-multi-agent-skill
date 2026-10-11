@@ -8,6 +8,7 @@ FAKE_PI_RECORD_DIR      Directory for start.jsonl, dialog.jsonl and exit.jsonl.
                         A start record holds the parent pid, which is the runner's.
 FAKE_PI_REPLY           Final assistant text. Default: "reply to: <prompt> (turn N)".
 FAKE_PI_DELAY           Seconds the run takes before it settles. Default 0.
+FAKE_PI_HOLD            Path of a file; the run does not settle before it exists.
 FAKE_PI_STOP_REASON     stopReason of the final message. Default "stop".
 FAKE_PI_ERROR_MESSAGE   errorMessage of the final message.
 FAKE_PI_TOOL            Emit a tool_execution_start for `bash` with this command.
@@ -19,7 +20,7 @@ FAKE_PI_IGNORE_SIGTERM  Ignore SIGTERM.
 FAKE_PI_IGNORE_EOF      Keep running after stdin closes.
 FAKE_PI_IGNORE_ABORT    Keep running after an abort and never answer it.
 FAKE_PI_SLOW_EXIT       Seconds a shutdown takes after stdin closes, writing one
-                        event per second. A failed write exits with status 1
+                        event every 0.1 s. A failed write exits with status 1
                         and exit reason "epipe", as pi 1.1.0 does.
 FAKE_PI_RUN             Shell command to run like a `bash` tool call: in its own
                         process group, which gets SIGKILL when stdin closes, as
@@ -61,14 +62,15 @@ TOOL_PROCS = []
 
 def leave(reason, code=0):
     if reason == "stdin_closed" and ENV("FAKE_PI_SLOW_EXIT"):
-        for _ in range(int(ENV("FAKE_PI_SLOW_EXIT"))):
+        end = time.monotonic() + float(ENV("FAKE_PI_SLOW_EXIT"))
+        while time.monotonic() < end:
             try:
                 sys.stdout.buffer.write(b'{"type":"shutdown_step"}\n')
                 sys.stdout.buffer.flush()
             except OSError:
                 reason, code = "epipe", 1
                 break
-            time.sleep(1)
+            time.sleep(min(0.1, max(0.0, end - time.monotonic())))
     if reason in ("stdin_closed", "epipe"):
         for proc in TOOL_PROCS:
             try:
@@ -259,14 +261,24 @@ def main():
             TOOL_PROCS.append(tool)
             record("tool", {"tool_pid": tool.pid})
 
+        hold = ENV("FAKE_PI_HOLD")
+
+        def held():
+            return bool(hold) and not os.path.exists(hold)
+
         steers = []
         abort_cmd = None
         deadline = time.monotonic() + float(ENV("FAKE_PI_DELAY") or 0)
-        while time.monotonic() < deadline or (tool is not None and tool.poll() is None):
-            wait = deadline - time.monotonic() if tool is None else 0.1
+        while time.monotonic() < deadline or held() or (tool is not None and tool.poll() is None):
+            if tool is not None:
+                wait = 0.1
+            elif held():
+                wait = 0.02
+            else:
+                wait = deadline - time.monotonic()
             reply = next_command(timeout=max(0.01, wait))
             if reply == "timeout":
-                if tool is None:
+                if tool is None and not held() and time.monotonic() >= deadline:
                     break
                 continue
             kind = reply.get("type")

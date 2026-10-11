@@ -47,19 +47,35 @@ STOP_SIGNALS = tuple(getattr(signal, n) for n in ("SIGTERM", "SIGHUP", "SIGINT")
 REMOVED_ENV = ("HERDR_ENV", "HERDR_PANE_ID", "HERDR_SOCKET_PATH")
 NOT_RUNNING = "job is not running; use resume"
 
+
+def time_scale():
+    """The factor for the timing constants below; tests set it to make them short."""
+    value = os.environ.get("MULTI_AGENT_TIME_SCALE") or "1"
+    try:
+        scale = float(value)
+    except ValueError:
+        scale = 0.0
+    if not 0 < scale < float("inf"):
+        raise SystemExit("multi-agent: error: MULTI_AGENT_TIME_SCALE needs a positive number, got: %s" % value)
+    return scale
+
+
+TIME_SCALE = time_scale()
 BACKGROUND_TIMEOUT_S = 3600
 DEFAULT_MAX_DEPTH = 2
-ACK_TIMEOUT_S = 10
-SETTLE_TIMEOUT_S = 30
-PI_EXIT_GRACE_S = 10
-PI_TERM_GRACE_S = 5
+ACK_TIMEOUT_S = 10 * TIME_SCALE
+SETTLE_TIMEOUT_S = 30 * TIME_SCALE
+PI_EXIT_GRACE_S = 10 * TIME_SCALE
+PI_TERM_GRACE_S = 5 * TIME_SCALE
 # After the runner accepts `kill`, the command waits this long for it to
 # exit: the runner's whole stop sequence for pi, plus a margin.
-RUNNER_STOP_GRACE_S = PI_EXIT_GRACE_S + PI_TERM_GRACE_S + 5
+RUNNER_STOP_GRACE_S = PI_EXIT_GRACE_S + PI_TERM_GRACE_S + 5 * TIME_SCALE
 # Starters hold the job's lock for a moment before they hand it to the
 # runner, and readers hold it shared for a moment, so a command that wants it
 # exclusively waits this long before it decides that a runner holds it.
-LOCK_TIMEOUT_S = 5
+LOCK_TIMEOUT_S = 5 * TIME_SCALE
+# How often `wait` checks whether the job has ended.
+WAIT_POLL_S = 0.5 * TIME_SCALE
 # sun_path holds the socket path and its trailing NUL.
 SUN_PATH_MAX = 104 if sys.platform == "darwin" or "bsd" in sys.platform else 108
 RECENT_S = 24 * 3600
@@ -1563,7 +1579,7 @@ def cmd_wait(argv):
             if lines:
                 sys.stdout.write("last_progress: %s\n" % lines[-1])
             return EXIT_STILL_RUNNING
-        time.sleep(0.5 if end is None else max(0.0, min(0.5, end - time.monotonic())))
+        time.sleep(WAIT_POLL_S if end is None else max(0.0, min(WAIT_POLL_S, end - time.monotonic())))
 
 
 def cmd_result(argv):
