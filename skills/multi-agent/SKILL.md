@@ -17,10 +17,9 @@ python3 "$SKILL_DIR/scripts/multi_agent.py" <command> ...
 
 ## When to delegate
 
-Delegate a task when it is independent of the rest of your work and its
-intermediate steps would only fill your context: researching a question,
-searching a large codebase, or several pieces of work that can run in
-parallel. Do small tasks yourself; starting an agent costs time and tokens.
+Delegate a task when when a task benefits from a multi-agent workflow, such as
+splitting work across agents, running it in parallel or in the background, or
+keeping a side task out of your own context.
 
 ## Pick a profile
 
@@ -31,9 +30,9 @@ this once per session to see the available profiles:
 python3 "$SKILL_DIR/scripts/multi_agent.py" profiles
 ```
 
-`general-purpose` (the default) has your tools and settings. `Explore` is a
-read-only search agent. Pass the profile with `--profile NAME`. To write
-your own profile, see `references/profiles.md`.
+There are two built-in profiles. `general-purpose` (the default) has your
+tools and settings. `Explore` is a read-only search agent. Pass a profile
+with `--profile NAME`.
 
 ## Run an agent
 
