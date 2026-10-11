@@ -40,7 +40,14 @@ resumes them. Any harness or agent that has a shell can use it.
 
 ## Install
 
-Link the skill into pi's skills directory:
+Install the skill with the open skills CLI:
+
+```bash
+npx skills install milanglacier/pi-multi-agent-skill --global --agent pi
+```
+
+The CLI copies the skill to `~/.agents/skills/multi-agent`, which pi reads.
+You can also link it into pi's skills directory yourself:
 
 ```bash
 ln -s "$PWD/skills/multi-agent" ~/.pi/agent/skills/multi-agent
