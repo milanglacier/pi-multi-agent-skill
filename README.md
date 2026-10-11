@@ -1,14 +1,42 @@
 # pi-multi-agent-skill
 
-A skill that lets a [pi](https://pi.dev) agent start other pi agents, run them
-in parallel or in the background, and wait for, steer, stop or resume them.
+A minimal, lightweight multi-agent skill and CLI for [pi](https://pi.dev). It
+needs no extension and adds no tools. Your agent starts other agents, runs
+them in parallel or in the background, and waits for, steers, stops or
+resumes them. Any harness or agent that has a shell can use it.
 
-Each agent is a separate `pi --mode rpc` process, so it loads the same
-extensions, MCP servers, skills and settings as an interactive pi. A Python
-script, `multi_agent.py`, starts the process, sends the prompt, answers dialog
-requests, records progress and keeps each agent's state as a named job. The
-calling agent drives the script with the shell commands described in
-`SKILL.md`.
+## Features
+
+- **Small token cost.** A subagent extension adds its tool definitions to
+  every request, whether or not your agent delegates anything. With this
+  skill, your agent's context holds only the skill's description, a few
+  dozen tokens, until it decides to delegate. Then it loads SKILL.md, which
+  is about 1.2K tokens and is all it needs for a fully working multi-agent
+  setup. The details of each command stay in separate references that it
+  reads only when needed.
+- **Everything a subagent tool does, without the tool.** Your agent gets the
+  same controls a dedicated extension would give it: start agents, wait for
+  them, `steer` one with a correction, `abort` it and keep what it has so
+  far, `resume` a finished job with a follow-up task, and see what each job
+  is doing. You can run the same commands yourself from a terminal.
+- **Parallel and background agents.** Run a quick question in the
+  foreground, or start several jobs at once and collect their results later.
+- **Stops when you stop.** A foreground agent ends when the command that
+  started it ends: press Esc, cancel the tool call or close the session, and
+  the agent and the commands it was running stop with it, at every level of
+  nesting. Background jobs keep running until they finish or time out.
+- **Your full pi setup.** Each agent loads the same extensions, MCP servers,
+  skills and settings as an interactive pi, and uses your model unless its
+  profile picks another.
+- **Profiles.** They work as in other subagent tools: each one sets an
+  agent's system prompt, model, thinking level and tools.
+- **Fork your conversation.** `--fork` hands the agent everything you have
+  discussed so far, for tasks that need that context.
+- **No hanging on prompts.** Agents never wait on a question nobody can
+  answer. A blocked approval comes back in the agent's result, so you can run
+  that step yourself.
+- **Works outside pi.** Claude Code, Codex or any other agent with a shell
+  can run the same commands to delegate work to pi agents.
 
 ## Install
 
@@ -18,12 +46,11 @@ Link the skill into pi's skills directory:
 ln -s "$PWD/skills/multi-agent" ~/.pi/agent/skills/multi-agent
 ```
 
-Requirements: pi and Python 3.9 or later. The script uses only the standard
-library.
+Requirements: pi and Python 3.9 or later. Nothing else to install.
 
 ## Usage
 
-The agent drives the skill, but the script is a normal command-line tool:
+Your agent drives the skill on its own, but the commands also work by hand:
 
 ```bash
 multi_agent.py run --profile Explore "Where is the retry policy defined?"
@@ -34,13 +61,9 @@ multi_agent.py resume review "Now check the client side"
 multi_agent.py list
 ```
 
-Two profiles ship with the skill: `general-purpose`, which behaves like the
-caller's own pi, and `Explore`, a read-only search agent. Profiles in
-`~/.pi/agent/agents/` and `<project>/.pi/agents/` replace them or add more.
-
 See [`skills/multi-agent/references/`](skills/multi-agent/references/) for
-every command and option, the job lifecycle, the profile format, the state
-layout and troubleshooting.
+every command and option, how jobs start and stop, the profile format, where
+state is kept and troubleshooting.
 
 ## Tests
 
@@ -48,14 +71,7 @@ layout and troubleshooting.
 python3 -m unittest discover tests
 ```
 
-The tests run the script against `tests/fake-pi`, an offline stand-in for
-`pi --mode rpc`, so they call no model.
-
-## Credits
-
-The `Explore` profile's prompt and description come from
-[pi-subagents](https://github.com/tintinweb/pi-subagents) by tintinweb,
-used under the MIT license.
+The tests use an offline stand-in for pi, so they call no model.
 
 ## License
 
