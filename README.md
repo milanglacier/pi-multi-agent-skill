@@ -5,35 +5,10 @@ needs no extension and adds no tools. Your agent starts other agents, runs
 them in parallel or in the background, and waits for, steers, stops or
 resumes them. Any harness or agent that has a shell can use it.
 
-## Features
-
-- **Small token cost.** A subagent extension adds its tool definitions to
-  every request, whether or not your agent delegates anything. With this
-  skill, your agent's context holds only the skill's description, a few
-  dozen tokens, until it decides to delegate. Then it loads SKILL.md, which
-  is about 1.2K tokens and is all it needs for a fully working multi-agent
-  setup. The details of each command stay in separate references that it
-  reads only when needed.
-- **Everything a subagent tool does, without the tool.** Your agent gets the
-  same controls a dedicated extension would give it: start agents, wait for
-  them, `steer` one with a correction, `abort` it and keep what it has so
-  far, `resume` a finished job with a follow-up task, and see what each job
-  is doing. You can run the same commands yourself from a terminal.
-- **Parallel and background agents.** Run a quick question in the
-  foreground, or start several jobs at once and collect their results later.
-- **Stops when you stop.** A foreground agent ends when the command that
-  started it ends: press Esc, cancel the tool call or close the session, and
-  the agent and the commands it was running stop with it, at every level of
-  nesting. Background jobs keep running until they finish or time out.
-- **Your full pi setup.** Each agent loads the same extensions, MCP servers,
-  skills and settings as an interactive pi, and uses your model unless its
-  profile picks another.
-- **Profiles.** They work as in other subagent tools: each one sets an
-  agent's system prompt, model, thinking level and tools.
-- **Fork your conversation.** `--fork` hands the agent everything you have
-  discussed so far, for tasks that need that context.
-- **Works outside pi.** Claude Code, Codex or any other agent with a shell
-  can run the same commands to delegate work to pi agents.
+It aims to be minimal while keeping subagents as useful as an extension and
+tool based approach. A subagent extension adds its tool definitions to every
+request, while this skill adds only a few dozen tokens of description to your
+agent's context until it decides to delegate.
 
 ## Install
 
@@ -63,6 +38,36 @@ ln -s "$PWD/skills/multi-agent" ~/.pi/agent/skills/multi-agent
 ```
 
 Requirements: pi and Python 3.9 or later. Nothing else to install.
+
+## Features
+
+- **Small token cost.** A subagent extension adds its tool definitions to
+  every request, whether or not your agent delegates anything. With this
+  skill, your agent's context holds only the skill's description, a few
+  dozen tokens, until it decides to delegate. Then it loads SKILL.md, which
+  is about 1.2K tokens and is all it needs for a fully working multi-agent
+  setup. The details of each command stay in separate references that it
+  reads only when needed.
+- **Everything a subagent tool does, without the tool.** Your agent gets the
+  same controls a dedicated extension would give it: start agents, wait for
+  them, `steer` one with a correction, `abort` it and keep what it has so
+  far, `resume` a finished job with a follow-up task, and see what each job
+  is doing. You can run the same commands yourself from a terminal.
+- **Parallel and background agents.** Run a quick question in the
+  foreground, or start several jobs at once and collect their results later.
+- **Stops when you stop.** A foreground agent ends when the command that
+  started it ends: press Esc, cancel the tool call or close the session, and
+  the agent and the commands it was running stop with it, at every level of
+  nesting. Background jobs keep running until they finish or time out.
+- **Your full pi setup.** Each agent loads the same extensions, MCP servers,
+  skills and settings as an interactive pi, and uses your model unless its
+  profile picks another.
+- **Profiles.** They work as in other subagent tools: each one sets an
+  agent's system prompt, model, thinking level and tools.
+- **Fork your conversation.** `--fork` hands the agent everything you have
+  discussed so far, for tasks that need that context.
+- **Works outside pi.** Claude Code, Codex or any other agent with a shell
+  can run the same commands to delegate work to pi agents.
 
 ## Usage
 
