@@ -16,12 +16,6 @@ has the form:
 python3 "$SKILL_DIR/scripts/multi_agent.py" <command> ...
 ```
 
-## When to delegate
-
-Delegate a task when when a task benefits from a multi-agent workflow, such as
-splitting work across agents, running it in parallel or in the background, or
-keeping a side task out of your own context.
-
 ## Pick a profile
 
 A profile sets an agent's system prompt, model, thinking level and tools. Run
