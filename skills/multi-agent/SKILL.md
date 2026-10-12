@@ -6,7 +6,8 @@ description: Delegate work to other agents. Use it when a task benefits from a m
 # Multi-agent
 
 This skill starts other agents and manages each one as a named job. An agent
-does not see your conversation, and you see only its final message.
+does not see your conversation unless you start it with `--fork`, and you see
+only its final message.
 
 `SKILL_DIR` below is the directory that contains this SKILL.md. Every command
 has the form:
@@ -52,8 +53,8 @@ EOF
 ```
 
 Write prompts that are self-contained: give the goal, the relevant paths and
-what the answer should contain. Add `--fork` only when the agent needs your
-conversation so far.
+what the answer should contain. When the task builds on your conversation so
+far, add `--fork` instead: the agent starts from a copy of it.
 
 For a long task, or several tasks in parallel:
 
