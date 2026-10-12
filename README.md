@@ -77,7 +77,7 @@ own workflow. This follows the minimalism of pi itself and the Unix
 philosophy: do one thing well and compose.
 
 - **Memory.** Agents do not share or keep memory between jobs. Use a memory
-  extension, or have agents write notes to files.
+  extension, or have agents write handoff notes.
 - **Scheduling.** There are no cron-style or recurring agents. Use cron,
   `systemd` timers or a scheduler extension to run the commands.
 - **Worktrees.** Agents are not isolated in git worktrees. Just prompt the
