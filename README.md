@@ -37,7 +37,19 @@ resumes them. Any harness or agent that has a shell can use it.
 
 ## Install
 
-Install the skill with the open skills CLI:
+Install the skill as a pi package from npm:
+
+```bash
+pi install npm:pi-multi-agent-skill
+```
+
+Or install directly from GitHub:
+
+```bash
+pi install git:github.com/milanglacier/pi-multi-agent-skill
+```
+
+You can also install the skill with the open skills CLI:
 
 ```bash
 npx skills install milanglacier/pi-multi-agent-skill --global --agent pi

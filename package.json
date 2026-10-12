@@ -1,0 +1,32 @@
+{
+  "name": "pi-multi-agent-skill",
+  "version": "0.1.0",
+  "description": "A minimal multi-agent skill+cli for pi. It adds no extension or tools, so it uses only a few dozen tokens of the context window until the main agent delegates, yet it gives the same controls as a subagent extension. Background agents keep running after the session closes, and any later session can collect their results.",
+  "license": "MIT",
+  "author": "Milan Glacier",
+  "homepage": "https://github.com/milanglacier/pi-multi-agent-skill#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/milanglacier/pi-multi-agent-skill.git"
+  },
+  "bugs": {
+    "url": "https://github.com/milanglacier/pi-multi-agent-skill/issues"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "agent-skill",
+    "multi-agent"
+  ],
+  "files": [
+    "skills/multi-agent/SKILL.md",
+    "skills/multi-agent/profiles/*.md",
+    "skills/multi-agent/references/*.md",
+    "skills/multi-agent/scripts/*.py",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "skills": ["./skills"]
+  }
+}
