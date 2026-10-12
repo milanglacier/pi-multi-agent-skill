@@ -32,8 +32,10 @@ job's result under a name. Keep new features at that size:
 - Leave out what an agent can do itself, such as worktrees or scheduling.
 - Stay harness agnostic: SKILL.md and the references name no specific
   extension, harness tool or permission mode.
-- Keep SKILL.md short; details go into `references/`, which the agent reads
-  only when needed. Update the references with the behavior they describe.
+- KEEP SKILL.md AND `references/` CONCISE. State only what an agent needs
+  to use the skill. DO NOT explain familiar syntax, implementation details,
+  or repeat information. Put necessary details in references, not SKILL.md,
+  and update them with the behavior they describe.
 - Stdlib only, Python 3.9 or later.
 
 
