@@ -12,6 +12,7 @@ import calendar
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -41,7 +42,9 @@ RESULT_DELIMITER = "--- multi-agent ---"
 DEFAULT_PROFILE = "general-purpose"
 NAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9])?$")
 DIALOG_METHODS = ("select", "confirm", "input", "editor")
-STOP_SIGNALS = tuple(getattr(signal, n) for n in ("SIGTERM", "SIGHUP", "SIGINT") if hasattr(signal, n))
+STOP_SIGNALS = tuple(
+    getattr(signal, n) for n in ("SIGTERM", "SIGHUP", "SIGINT") if hasattr(signal, n)
+)
 # Removed from the agent's environment so the herdr extension inside the agent
 # does not report state for the caller's pane.
 REMOVED_ENV = ("HERDR_ENV", "HERDR_PANE_ID", "HERDR_SOCKET_PATH")
@@ -56,7 +59,9 @@ def time_scale():
     except ValueError:
         scale = 0.0
     if not 0 < scale < float("inf"):
-        raise SystemExit("multi-agent: error: MULTI_AGENT_TIME_SCALE needs a positive number, got: %s" % value)
+        raise SystemExit(
+            f"multi-agent: error: MULTI_AGENT_TIME_SCALE needs a positive number, got: {value}"
+        )
     return scale
 
 
@@ -139,7 +144,7 @@ def usage_error(message):
 
 
 def note(message):
-    sys.stderr.write("multi-agent: %s\n" % message)
+    sys.stderr.write(f"multi-agent: {message}\n")
     sys.stderr.flush()
 
 
@@ -186,7 +191,7 @@ def write_atomic(path, text):
     """Write a state file through a temporary file and a rename."""
     tmp = os.path.join(
         os.path.dirname(path),
-        ".%s.tmp-%d-%d" % (os.path.basename(path), os.getpid(), threading.get_ident()),
+        f".{os.path.basename(path)}.tmp-{os.getpid()}-{threading.get_ident()}",
     )
     with open(tmp, "w", encoding="utf-8") as fh:
         fh.write(text)
@@ -213,12 +218,12 @@ def wait_while(check, timeout):
 def format_age(seconds):
     seconds = max(0, int(seconds))
     if seconds < 60:
-        return "%ds" % seconds
+        return f"{seconds}s"
     if seconds < 3600:
-        return "%dm" % (seconds // 60)
+        return f"{seconds // 60}m"
     if seconds < 86400:
-        return "%dh" % (seconds // 3600)
-    return "%dd" % (seconds // 86400)
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
 
 
 def excerpt(text, limit=120):
@@ -247,12 +252,16 @@ def project_slug(path):
 
 
 def state_root():
-    base = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(
+        os.path.expanduser("~"), ".local", "state"
+    )
     return os.path.abspath(os.path.join(base, "pi-multi-agent"))
 
 
 def pi_agent_dir():
-    return os.path.expanduser(os.environ.get("PI_CODING_AGENT_DIR") or os.path.join("~", ".pi", "agent"))
+    return os.path.expanduser(
+        os.environ.get("PI_CODING_AGENT_DIR") or os.path.join("~", ".pi", "agent")
+    )
 
 
 def jobs_dir(project):
@@ -406,7 +415,9 @@ def load_profiles(cwd):
                 continue
             fields, body = parse_frontmatter(text)
             name = text_field(fields, "name") or entry[: -len(".md")]
-            found.setdefault(name.lower(), make_profile(name, fields, body, path, scope))
+            found.setdefault(
+                name.lower(), make_profile(name, fields, body, path, scope)
+            )
     return found
 
 
@@ -415,11 +426,16 @@ def find_profile(cwd, name):
     profile = profiles.get(name.lower())
     if profile is None or not profile["enabled"]:
         available = sorted(p["name"] for p in profiles.values() if p["enabled"])
-        raise CommandError("unknown profile: %s (available: %s)" % (name, ", ".join(available) or "none"))
+        raise CommandError(
+            "unknown profile: {} (available: {})".format(
+                name, ", ".join(available) or "none"
+            )
+        )
     if profile["prompt_mode"] not in ("append", "replace"):
         raise CommandError(
-            "profile %s in %s: prompt_mode must be append or replace, got %s"
-            % (profile["name"], profile["source"], profile["prompt_mode"])
+            "profile {} in {}: prompt_mode must be append or replace, got {}".format(
+                profile["name"], profile["source"], profile["prompt_mode"]
+            )
         )
     return profile
 
@@ -476,14 +492,16 @@ def append_prompt(profile, name):
 def validate_name(name):
     if not NAME_RE.match(name):
         raise usage_error(
-            "invalid job name: %r (use letters, digits, '.', '_' and '-', start and end with a"
-            " letter or digit, at most 64 characters)" % name
+            f"invalid job name: {name!r} (use letters, digits, '.', '_' and '-', start and end with a"
+            " letter or digit, at most 64 characters)"
         )
 
 
 def default_name(profile_name):
-    base = re.sub(r"[^a-z0-9._-]+", "-", profile_name.lower()).strip("._-")[:59] or "agent"
-    return "%s-%s" % (base, secrets.token_hex(2))
+    base = (
+        re.sub(r"[^a-z0-9._-]+", "-", profile_name.lower()).strip("._-")[:59] or "agent"
+    )
+    return f"{base}-{secrets.token_hex(2)}"
 
 
 def job_path(job_dir, name):
@@ -510,7 +528,7 @@ def job_lock(job_dir, busy_message):
     try:
         fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
     except FileNotFoundError:
-        raise CommandError("job %s was removed" % name)
+        raise CommandError(f"job {name} was removed")
     try:
         end = time.monotonic() + LOCK_TIMEOUT_S
         while True:
@@ -523,15 +541,14 @@ def job_lock(job_dir, busy_message):
                 time.sleep(0.05)
             except OSError as exc:
                 raise CommandError(
-                    "flock does not work on %s (%s); set XDG_STATE_HOME to a local file system"
-                    % (state_dir_of(job_dir), exc.strerror or exc)
+                    f"flock does not work on {state_dir_of(job_dir)} ({exc.strerror or exc}); set XDG_STATE_HOME to a local file system"
                 )
         # `rm` may have removed the job while this command waited.
         try:
             if os.stat(path).st_ino != os.fstat(fd).st_ino:
-                raise CommandError("job %s was removed" % name)
+                raise CommandError(f"job {name} was removed")
         except FileNotFoundError:
-            raise CommandError("job %s was removed" % name)
+            raise CommandError(f"job {name} was removed")
     except BaseException:
         os.close(fd)
         raise
@@ -579,7 +596,9 @@ def socket_path(job_dir):
 
 def check_socket_path(job_dir):
     if len(os.fsencode(socket_path(job_dir))) >= SUN_PATH_MAX:
-        raise CommandError("the socket path for this job is too long; set XDG_STATE_HOME to a shorter path")
+        raise CommandError(
+            "the socket path for this job is too long; set XDG_STATE_HOME to a shorter path"
+        )
 
 
 def listen_control(job_dir):
@@ -598,7 +617,7 @@ def listen_control(job_dir):
         server.listen(64)
     except OSError as exc:
         server.close()
-        raise CommandError("could not create the control socket %s: %s" % (path, exc))
+        raise CommandError(f"could not create the control socket {path}: {exc}")
     return server
 
 
@@ -621,10 +640,11 @@ def find_job(name):
         return matches[0]
     if matches:
         raise CommandError(
-            "job %s exists in several projects; run the command from the project's directory:\n  %s"
-            % (name, "\n  ".join(matches))
+            "job {} exists in several projects; run the command from the project's directory:\n  {}".format(
+                name, "\n  ".join(matches)
+            )
         )
-    raise CommandError("unknown job: %s" % name)
+    raise CommandError(f"unknown job: {name}")
 
 
 def model_label(job_dir, job):
@@ -644,7 +664,7 @@ def format_result(job_dir, status):
     job = read_json(job_path(job_dir, "job.json"), {})
     output = (read_text(job_path(job_dir, "output.txt"), "") or "").rstrip("\n")
     duration = duration_s(job_dir)
-    return "%s\n\n%s\nname: %s\nstatus: %s\nprofile: %s\nmodel: %s\nduration_s: %s\n" % (
+    return "{}\n\n{}\nname: {}\nstatus: {}\nprofile: {}\nmodel: {}\nduration_s: {}\n".format(
         output if output.strip() else "(no output)",
         RESULT_DELIMITER,
         os.path.basename(job_dir),
@@ -666,7 +686,7 @@ def print_result(job_dir, status):
 
 
 def append_progress(job_dir, message):
-    line = "%s %s\n" % (time.strftime("%H:%M:%S"), message)
+    line = "{} {}\n".format(time.strftime("%H:%M:%S"), message)
     try:
         with open(job_path(job_dir, "progress.log"), "a", encoding="utf-8") as fh:
             fh.write(line)
@@ -684,9 +704,12 @@ def record_end(job_dir, status, output=None, detail=None):
         write_atomic(job_path(job_dir, "output.txt"), output + ("\n" if output else ""))
     write_atomic(job_path(job_dir, "ended_at"), utcnow() + "\n")
     write_atomic(job_path(job_dir, "status"), status + "\n")
-    write_atomic(job_path(job_dir, "exit_code"), "%d\n" % (EXIT_OK if status == "done" else EXIT_FAIL))
-    message = "run %s ended: %s" % (read_int(job_path(job_dir, "runs")), status)
-    append_progress(job_dir, message + (" (%s)" % detail if detail else ""))
+    write_atomic(
+        job_path(job_dir, "exit_code"),
+        f"{EXIT_OK if status == 'done' else EXIT_FAIL}\n",
+    )
+    message = "run {} ended: {}".format(read_int(job_path(job_dir, "runs")), status)
+    append_progress(job_dir, message + (f" ({detail})" if detail else ""))
 
 
 # --- runner ------------------------------------------------------------------
@@ -818,8 +841,7 @@ class Runner:
             self.caller_fd = None
 
     def start(self):
-        stderr_fh = open(job_path(self.job_dir, "stderr.txt"), "wb")
-        try:
+        with open(job_path(self.job_dir, "stderr.txt"), "wb") as stderr_fh:
             self.proc = subprocess.Popen(
                 pi_argv(self.job_dir, self.job),
                 cwd=self.job["cwd"],
@@ -831,8 +853,6 @@ class Runner:
                 # group never reach it; the runner stops it through its stdin.
                 start_new_session=True,
             )
-        finally:
-            stderr_fh.close()
         self.stdin_open = True
         self.out_fd = self.proc.stdout.fileno()
         self.selector.register(self.out_fd, selectors.EVENT_READ, "pi")
@@ -858,7 +878,7 @@ class Runner:
 
     def new_id(self, kind):
         self.serial += 1
-        return "%s-%d" % (kind, self.serial)
+        return f"{kind}-{self.serial}"
 
     def pump(self, timeout):
         """Wait up to timeout seconds (None: no limit) and handle what arrives.
@@ -866,7 +886,9 @@ class Runner:
         That is pi's records, control requests, signals and the end of the
         foreground command.
         """
-        for key, _events in self.selector.select(None if timeout is None else max(0.0, timeout)):
+        for key, _events in self.selector.select(
+            None if timeout is None else max(0.0, timeout)
+        ):
             if key.data == "wake":
                 try:
                     while os.read(self.wake_r, 512):
@@ -920,27 +942,49 @@ class Runner:
             elif rid in self.pending_acks:
                 conn = self.pending_acks.pop(rid)
                 if record.get("success"):
-                    disposition = (record.get("data") or {}).get("disposition") or "queued"
+                    disposition = (record.get("data") or {}).get(
+                        "disposition"
+                    ) or "queued"
                     self.reply(conn, {"ok": True, "disposition": disposition})
                 else:
-                    self.reply(conn, {"ok": False, "error": record.get("error") or "steer failed"})
+                    self.reply(
+                        conn,
+                        {"ok": False, "error": record.get("error") or "steer failed"},
+                    )
         elif kind == "tool_execution_start":
-            self.progress("%s %s" % (record.get("toolName", "?"), short_args(record.get("args"))))
+            self.progress(
+                "{} {}".format(
+                    record.get("toolName", "?"), short_args(record.get("args"))
+                )
+            )
         elif kind == "message_end":
             message = record.get("message") or {}
             if message.get("role") == "assistant":
                 self.on_assistant_message(message)
         elif kind == "auto_retry_start":
             self.progress(
-                "retry %s/%s: %s"
-                % (record.get("attempt"), record.get("maxAttempts"), excerpt(record.get("errorMessage") or ""))
+                "retry {}/{}: {}".format(
+                    record.get("attempt"),
+                    record.get("maxAttempts"),
+                    excerpt(record.get("errorMessage") or ""),
+                )
             )
         elif kind == "compaction_start":
-            self.progress("compaction (%s)" % record.get("reason", "?"))
+            self.progress("compaction ({})".format(record.get("reason", "?")))
         elif kind == "extension_ui_request" and record.get("method") in DIALOG_METHODS:
             # No person can answer. Without a reply the extension would wait, often forever.
-            self.send({"type": "extension_ui_response", "id": record.get("id"), "cancelled": True})
-            self.progress("denied: %s" % excerpt(record.get("title") or record.get("method")))
+            self.send(
+                {
+                    "type": "extension_ui_response",
+                    "id": record.get("id"),
+                    "cancelled": True,
+                }
+            )
+            self.progress(
+                "denied: {}".format(
+                    excerpt(record.get("title") or record.get("method"))
+                )
+            )
         elif kind == "agent_settled":
             self.settled = True
 
@@ -951,11 +995,19 @@ class Runner:
         # As in pi's get_last_assistant_text, an aborted message without
         # content keeps the text before it.
         if content or self.last_stop != "aborted":
-            parts = content if isinstance(content, list) else [{"type": "text", "text": str(content)}]
-            text = "".join(p.get("text") or "" for p in parts if isinstance(p, dict) and p.get("type") == "text")
+            parts = (
+                content
+                if isinstance(content, list)
+                else [{"type": "text", "text": str(content)}]
+            )
+            text = "".join(
+                p.get("text") or ""
+                for p in parts
+                if isinstance(p, dict) and p.get("type") == "text"
+            )
             self.last_text = text.strip() or None
         if message.get("provider") and message.get("model"):
-            self.model_used = "%s/%s" % (message["provider"], message["model"])
+            self.model_used = "{}/{}".format(message["provider"], message["model"])
         elif message.get("model"):
             self.model_used = message["model"]
         usage = message.get("usage") or {}
@@ -1015,7 +1067,7 @@ class Runner:
             if self.send({"id": rid, "type": "steer", "message": message}):
                 # Answered when pi answers the steer.
                 self.pending_acks[rid] = conn
-                self.progress("steer: %s" % excerpt(message))
+                self.progress(f"steer: {excerpt(message)}")
             else:
                 self.reply(conn, {"ok": False, "error": NOT_RUNNING})
         elif kind == "abort":
@@ -1030,7 +1082,7 @@ class Runner:
             self.kill_requested = True
             self.reply(conn, {"ok": True, "disposition": "stopping"})
         else:
-            self.reply(conn, {"ok": False, "error": "unknown request type: %s" % kind})
+            self.reply(conn, {"ok": False, "error": f"unknown request type: {kind}"})
 
     def reply(self, conn, obj):
         try:
@@ -1097,15 +1149,21 @@ class Runner:
         try:
             self.start()
         except OSError as exc:
-            return self.conclude("failed", "could not start %s: %s" % (pi_bin(), exc))
-        self.progress("run %s started (%s)" % (read_int(job_path(self.job_dir, "runs")), self.job["mode"]))
+            return self.conclude("failed", f"could not start {pi_bin()}: {exc}")
+        self.progress(
+            "run {} started ({})".format(
+                read_int(job_path(self.job_dir, "runs")), self.job["mode"]
+            )
+        )
         self.send({"id": "prompt", "type": "prompt", "message": self.prompt})
 
         timeout = self.job.get("timeout")
         deadline = time.monotonic() + timeout if timeout else None
         while True:
             if self.signum is not None:
-                return self.finish_killed("stopped by %s" % signal.Signals(self.signum).name)
+                return self.finish_killed(
+                    f"stopped by {signal.Signals(self.signum).name}"
+                )
             if self.caller_gone:
                 return self.finish_killed("stopped: the caller's command ended")
             if self.kill_requested:
@@ -1113,7 +1171,7 @@ class Runner:
             now = time.monotonic()
             if deadline is not None and now >= deadline and not self.timing_out:
                 self.timing_out = True
-                self.progress("timeout after %ss; aborting" % format_seconds(timeout))
+                self.progress(f"timeout after {format_seconds(timeout)}s; aborting")
                 self.send_abort()
             if self.stop_deadline is not None and now >= self.stop_deadline:
                 self.progress("agent did not settle after the abort")
@@ -1123,7 +1181,10 @@ class Runner:
             response = self.prompt_response
             if response is not None and not response.get("success"):
                 return self.finish("failed", response.get("error") or "prompt rejected")
-            if response is not None and (response.get("data") or {}).get("disposition") == "handled":
+            if (
+                response is not None
+                and (response.get("data") or {}).get("disposition") == "handled"
+            ):
                 return self.finish("done")
             if self.eof:
                 return self.finish_eof()
@@ -1160,7 +1221,9 @@ class Runner:
         self.stop_pi()
         stderr = read_text(job_path(self.job_dir, "stderr.txt"), "") or ""
         tail = "\n".join(stderr.rstrip("\n").splitlines()[-20:])
-        output = "pi exited before the run finished (exit status %s)." % self.proc.returncode
+        output = (
+            f"pi exited before the run finished (exit status {self.proc.returncode})."
+        )
         if tail:
             output += " Last lines of its stderr:\n\n" + tail
         return self.conclude("failed", output)
@@ -1176,7 +1239,11 @@ class Runner:
         self.close_stdin()
         if self.proc is None:
             return
-        for signum, grace in ((None, PI_EXIT_GRACE_S), (signal.SIGTERM, PI_TERM_GRACE_S), (signal.SIGKILL, 0)):
+        for signum, grace in (
+            (None, PI_EXIT_GRACE_S),
+            (signal.SIGTERM, PI_TERM_GRACE_S),
+            (signal.SIGKILL, 0),
+        ):
             if self.proc.poll() is not None:
                 break
             if signum is not None:
@@ -1193,7 +1260,10 @@ class Runner:
 
     def conclude(self, status, output):
         self.finishing = True
-        write_atomic(job_path(self.job_dir, "usage.json"), json.dumps(self.usage, indent=2) + "\n")
+        write_atomic(
+            job_path(self.job_dir, "usage.json"),
+            json.dumps(self.usage, indent=2) + "\n",
+        )
         if self.model_used:
             write_atomic(job_path(self.job_dir, "model"), self.model_used + "\n")
         record_end(self.job_dir, status, output)
@@ -1210,7 +1280,7 @@ class Runner:
 
 
 def format_seconds(value):
-    return ("%g" % value) if value is not None else "none"
+    return (f"{value:g}") if value is not None else "none"
 
 
 def run_runner(job_dir, lock_fd, server, caller_fd=None):
@@ -1221,11 +1291,15 @@ def run_runner(job_dir, lock_fd, server, caller_fd=None):
     runner = Runner(job_dir, lock_fd, server, caller_fd)
     try:
         return runner.run()
-    except Exception:
+    except Exception:  # noqa: BLE001
+        # Record unexpected failures and stop pi before releasing the job's lock.
         with open(job_path(job_dir, "runner.log"), "a", encoding="utf-8") as fh:
-            fh.write("%s\n%s\n" % (utcnow(), traceback.format_exc()))
+            fh.write(f"{utcnow()}\n{traceback.format_exc()}\n")
         runner.emergency_stop()
-        return runner.conclude("failed", "the runner failed; see %s" % job_path(job_dir, "runner.log"))
+        return runner.conclude(
+            "failed",
+            "the runner failed; see {}".format(job_path(job_dir, "runner.log")),
+        )
     finally:
         runner.close_control()
 
@@ -1248,8 +1322,7 @@ def check_depth():
         limit = DEFAULT_MAX_DEPTH
     if depth >= limit:
         raise CommandError(
-            "cannot start an agent: this caller is at depth %d and MULTI_AGENT_MAX_DEPTH is %d"
-            % (depth, limit)
+            f"cannot start an agent: this caller is at depth {depth} and MULTI_AGENT_MAX_DEPTH is {limit}"
         )
     return depth + 1
 
@@ -1269,14 +1342,20 @@ def start_run(job_dir, lock_fd, server, job, prompt, background, timeout, run_ki
     and holds the write end of the pipe whose end of file stops the run.
     """
     try:
-        proc, caller_w = start_runner(job_dir, lock_fd, server, job, prompt, background, timeout, run_kind)
+        proc, caller_w = start_runner(
+            job_dir, lock_fd, server, job, prompt, background, timeout, run_kind
+        )
     finally:
         server.close()
         os.close(lock_fd)
     if background:
-        sys.stdout.write("job: %s\nstatus: running\ntimeout_s: %s\n" % (job["name"], format_seconds(timeout)))
+        sys.stdout.write(
+            "job: {}\nstatus: running\ntimeout_s: {}\n".format(
+                job["name"], format_seconds(timeout)
+            )
+        )
         return EXIT_OK
-    note("started job %s" % job["name"])
+    note("started job {}".format(job["name"]))
     return follow_runner(job_dir, proc, caller_w)
 
 
@@ -1294,13 +1373,20 @@ def start_runner(job_dir, lock_fd, server, job, prompt, background, timeout, run
     for name in PREVIOUS_RUN_FILES:
         remove(job_path(job_dir, name))
     runs = (read_int(job_path(job_dir, "runs")) or 0) + 1
-    write_atomic(job_path(job_dir, "runs"), "%d\n" % runs)
+    write_atomic(job_path(job_dir, "runs"), f"{runs}\n")
     write_atomic(job_path(job_dir, "started_at"), utcnow() + "\n")
     write_atomic(job_path(job_dir, "status"), "running\n")
 
     # The job directory follows `__runner` and a space, so a person can find
     # a stuck runner with `pkill -f` (see kill_job).
-    argv = [sys.executable, SCRIPT_PATH, "__runner", job_dir, str(lock_fd), str(server.fileno())]
+    argv = [
+        sys.executable,
+        SCRIPT_PATH,
+        "__runner",
+        job_dir,
+        str(lock_fd),
+        str(server.fileno()),
+    ]
     pass_fds = [lock_fd, server.fileno()]
     caller_r = caller_w = None
     if not background:
@@ -1327,7 +1413,7 @@ def start_runner(job_dir, lock_fd, server, job, prompt, background, timeout, run
         for fd in (caller_r, caller_w):
             if fd is not None:
                 os.close(fd)
-        message = "could not start the runner: %s" % exc
+        message = f"could not start the runner: {exc}"
         record_end(job_dir, "failed", "error: " + message, message)
         raise CommandError(message)
     if caller_r is not None:
@@ -1398,14 +1484,14 @@ class Args:
                 if name in with_value:
                     if not eq:
                         if i + 1 >= len(argv):
-                            raise usage_error("%s needs a value" % name)
+                            raise usage_error(f"{name} needs a value")
                         i += 1
                         value = argv[i]
                     self.values[name] = value
                 elif name in flags and not eq:
                     self.flags.add(name)
                 else:
-                    raise usage_error("unknown option: %s" % arg)
+                    raise usage_error(f"unknown option: {arg}")
             i += 1
 
 
@@ -1413,9 +1499,9 @@ def parse_seconds(value, option):
     try:
         seconds = float(value)
     except ValueError:
-        raise usage_error("%s needs a number of seconds, got: %s" % (option, value))
-    if seconds < 0 or seconds != seconds:
-        raise usage_error("%s needs a number of seconds, got: %s" % (option, value))
+        raise usage_error(f"{option} needs a number of seconds, got: {value}")
+    if seconds < 0 or math.isnan(seconds):
+        raise usage_error(f"{option} needs a number of seconds, got: {value}")
     return seconds
 
 
@@ -1428,18 +1514,18 @@ def run_timeout(args, background):
 
 def read_message(args, what):
     if len(args.positional) != 1:
-        raise usage_error("expected one %s (a string, or - to read stdin)" % what)
+        raise usage_error(f"expected one {what} (a string, or - to read stdin)")
     text = args.positional[0]
     if text == "-":
         text = sys.stdin.read().rstrip("\n")
     if not text.strip():
-        raise usage_error("empty %s" % what)
+        raise usage_error(f"empty {what}")
     return text
 
 
 def one_name(args, command):
     if len(args.positional) != 1:
-        raise usage_error("%s needs one job name" % command)
+        raise usage_error(f"{command} needs one job name")
     return args.positional[0]
 
 
@@ -1460,17 +1546,23 @@ def cmd_run(argv):
     project = logical_cwd()
     cwd = project
     if "--cwd" in args.values:
-        cwd = os.path.normpath(os.path.join(project, os.path.expanduser(args.values["--cwd"])))
+        cwd = os.path.normpath(
+            os.path.join(project, os.path.expanduser(args.values["--cwd"]))
+        )
         if not os.path.isdir(cwd):
-            raise usage_error("--cwd is not a directory: %s" % args.values["--cwd"])
+            raise usage_error(
+                "--cwd is not a directory: {}".format(args.values["--cwd"])
+            )
     prompt = read_message(args, "prompt")
     fork = None
     if "--fork" in args.flags:
         fork = os.environ.get("PI_SESSION_FILE")
         if not fork:
-            raise CommandError("--fork needs PI_SESSION_FILE, which is not set in this environment")
+            raise CommandError(
+                "--fork needs PI_SESSION_FILE, which is not set in this environment"
+            )
         if not os.path.isfile(fork):
-            raise CommandError("--fork: PI_SESSION_FILE does not exist: %s" % fork)
+            raise CommandError(f"--fork: PI_SESSION_FILE does not exist: {fork}")
     depth = check_depth()
     profile = find_profile(cwd, args.values.get("--profile") or DEFAULT_PROFILE)
 
@@ -1485,8 +1577,8 @@ def cmd_run(argv):
             os.mkdir(os.path.join(root, name))
         except FileExistsError:
             raise CommandError(
-                "job %s already exists in this project; use `resume %s` to continue it, pick"
-                " another --name, or `rm %s` first" % (name, name, name)
+                f"job {name} already exists in this project; use `resume {name}` to continue it, pick"
+                f" another --name, or `rm {name}` first"
             )
     else:
         for _attempt in range(100):
@@ -1503,11 +1595,15 @@ def cmd_run(argv):
     lock_fd = None
     try:
         # Taken at once, so the job directory never exists without a lock.
-        lock_fd = job_lock(job_dir, "job %s is busy; try again" % name)
+        lock_fd = job_lock(job_dir, f"job {name} is busy; try again")
         model = resolve_model(args.values.get("--model"), profile)
         thinking = resolve_thinking(args.values.get("--thinking"), profile)
-        pi_args = profile_args(profile, model, thinking, job_path(job_dir, "system-prompt.md"))
-        write_atomic(job_path(job_dir, "append-prompt.md"), append_prompt(profile, name))
+        pi_args = profile_args(
+            profile, model, thinking, job_path(job_dir, "system-prompt.md")
+        )
+        write_atomic(
+            job_path(job_dir, "append-prompt.md"), append_prompt(profile, name)
+        )
         session_dir = sessions_dir(project)
         os.makedirs(session_dir, exist_ok=True)
         job = {
@@ -1546,47 +1642,65 @@ def cmd_resume(argv):
     check_depth()
     # A runner holds the lock while the job runs, so taking it proves that
     # nothing runs, and keeps it so until the new runner holds it.
-    lock_fd = job_lock(job_dir, "job %s is running; use steer, or wait for it to finish" % name)
+    lock_fd = job_lock(
+        job_dir, f"job {name} is running; use steer, or wait for it to finish"
+    )
     try:
         job = read_json(job_path(job_dir, "job.json"))
         if not job:
-            raise CommandError("job %s has no readable job.json" % name)
+            raise CommandError(f"job {name} has no readable job.json")
         if not os.path.isdir(job["cwd"]):
-            raise CommandError("the job's working directory no longer exists: %s" % job["cwd"])
+            raise CommandError(
+                "the job's working directory no longer exists: {}".format(job["cwd"])
+            )
         server = listen_control(job_dir)
     except BaseException:
         os.close(lock_fd)
         raise
     if not find_session_file(job["session_dir"], name):
-        note("no session file found for %s; the agent starts a new conversation" % name)
-    return start_run(job_dir, lock_fd, server, job, prompt, background, timeout, "resume")
+        note(f"no session file found for {name}; the agent starts a new conversation")
+    return start_run(
+        job_dir, lock_fd, server, job, prompt, background, timeout, "resume"
+    )
 
 
 def cmd_wait(argv):
     args = Args(argv, ("--timeout",), ())
     job_dir = find_job(one_name(args, "wait"))
-    timeout = parse_seconds(args.values["--timeout"], "--timeout") if "--timeout" in args.values else None
+    timeout = (
+        parse_seconds(args.values["--timeout"], "--timeout")
+        if "--timeout" in args.values
+        else None
+    )
     end = None if timeout is None else time.monotonic() + timeout
     while True:
         status = job_state(job_dir)
         if status != "running":
             return print_result(job_dir, status)
         if end is not None and time.monotonic() >= end:
-            lines = (read_text(job_path(job_dir, "progress.log"), "") or "").splitlines()
+            lines = (
+                read_text(job_path(job_dir, "progress.log"), "") or ""
+            ).splitlines()
             sys.stdout.write(
-                "job: %s\nstatus: running\nwaited_s: %s\n" % (os.path.basename(job_dir), format_seconds(timeout))
+                f"job: {os.path.basename(job_dir)}\nstatus: running\nwaited_s: {format_seconds(timeout)}\n"
             )
             if lines:
-                sys.stdout.write("last_progress: %s\n" % lines[-1])
+                sys.stdout.write(f"last_progress: {lines[-1]}\n")
             return EXIT_STILL_RUNNING
-        time.sleep(WAIT_POLL_S if end is None else max(0.0, min(WAIT_POLL_S, end - time.monotonic())))
+        time.sleep(
+            WAIT_POLL_S
+            if end is None
+            else max(0.0, min(WAIT_POLL_S, end - time.monotonic()))
+        )
 
 
 def cmd_result(argv):
     job_dir = find_job(one_name(Args(argv, (), ()), "result"))
     status = job_state(job_dir)
     if status == "running":
-        raise CommandError("job %s is still running; use wait" % os.path.basename(job_dir))
+        raise CommandError(
+            f"job {os.path.basename(job_dir)} is still running; use wait"
+        )
     return print_result(job_dir, status)
 
 
@@ -1610,7 +1724,9 @@ def connect_runner(job_dir):
         if job_state(job_dir) != "running":
             raise NotRunning()
         if time.monotonic() >= end:
-            raise CommandError("the runner of job %s does not accept requests" % os.path.basename(job_dir))
+            raise CommandError(
+                f"the runner of job {os.path.basename(job_dir)} does not accept requests"
+            )
         time.sleep(0.05)
 
 
@@ -1626,7 +1742,8 @@ def send_request(job_dir, request, timeout_message):
         sock.settimeout(ACK_TIMEOUT_S)
         sock.sendall(json.dumps(request).encode("utf-8") + b"\n")
         line = sock.makefile("rb").readline()
-    except socket.timeout:
+    except socket.timeout:  # noqa: UP041
+        # Python 3.9 uses a separate exception for socket timeouts.
         raise CommandError(timeout_message)
     except OSError:
         line = b""
@@ -1642,12 +1759,16 @@ def send_request(job_dir, request, timeout_message):
 def send_control(job_dir, request):
     name = os.path.basename(job_dir)
     reply = send_request(
-        job_dir, request, "the runner of job %s did not reply within %d seconds" % (name, ACK_TIMEOUT_S)
+        job_dir,
+        request,
+        f"the runner of job {name} did not reply within {int(ACK_TIMEOUT_S)} seconds",
     )
     if reply is None:
         if wait_while(lambda: job_state(job_dir) == "running", 2):
             raise NotRunning()
-        raise CommandError("the runner of job %s closed the connection without a reply" % name)
+        raise CommandError(
+            f"the runner of job {name} closed the connection without a reply"
+        )
     if not reply.get("ok"):
         raise CommandError(reply.get("error") or "request failed")
     return reply
@@ -1661,14 +1782,22 @@ def cmd_steer(argv):
     message = read_message(args, "message")
     job_dir = find_job(name)
     reply = send_control(job_dir, {"type": "steer", "message": message})
-    sys.stdout.write("job: %s\nsteer: %s\n" % (os.path.basename(job_dir), reply.get("disposition", "queued")))
+    sys.stdout.write(
+        "job: {}\nsteer: {}\n".format(
+            os.path.basename(job_dir), reply.get("disposition", "queued")
+        )
+    )
     return EXIT_OK
 
 
 def cmd_abort(argv):
     job_dir = find_job(one_name(Args(argv, (), ()), "abort"))
     reply = send_control(job_dir, {"type": "abort"})
-    sys.stdout.write("job: %s\nabort: %s\n" % (os.path.basename(job_dir), reply.get("disposition", "requested")))
+    sys.stdout.write(
+        "job: {}\nabort: {}\n".format(
+            os.path.basename(job_dir), reply.get("disposition", "requested")
+        )
+    )
     return EXIT_OK
 
 
@@ -1682,15 +1811,15 @@ def kill_job(job_dir):
     name = os.path.basename(job_dir)
     # `[_]` keeps the pattern from matching the command line of a shell that
     # runs this pkill, as `sh -c` and a bash tool do.
-    pattern = "[_]_runner %s " % re.sub(r"([.^$*+?()\[\]{}|\\])", r"\\\1", job_dir)
-    stuck = "the runner of job %s is not responding; to stop it, run: pkill -KILL -f %s" % (
-        name,
-        shlex.quote(pattern),
+    pattern = "[_]_runner {} ".format(
+        re.sub(r"([.^$*+?()\[\]{}|\\])", r"\\\1", job_dir)
     )
+    stuck = f"the runner of job {name} is not responding; to stop it, run: pkill -KILL -f {shlex.quote(pattern)}"
     try:
         reply = send_request(job_dir, {"type": "kill"}, stuck)
     except NotRunning:
         reply = {"ok": False}
+
     def running():
         return job_state(job_dir) == "running"
 
@@ -1699,8 +1828,8 @@ def kill_job(job_dir):
     if not wait_while(running, RUNNER_STOP_GRACE_S):
         raise CommandError(stuck)
     if reply is not None and not reply.get("ok"):
-        return "job: %s\nstatus: %s (not running)\n" % (name, job_state(job_dir))
-    return "job: %s\nstatus: %s\n" % (name, job_state(job_dir))
+        return f"job: {name}\nstatus: {job_state(job_dir)} (not running)\n"
+    return f"job: {name}\nstatus: {job_state(job_dir)}\n"
 
 
 def project_jobs(project):
@@ -1709,7 +1838,9 @@ def project_jobs(project):
         names = sorted(os.listdir(root))
     except OSError:
         return []
-    return [os.path.join(root, n) for n in names if os.path.isdir(os.path.join(root, n))]
+    return [
+        os.path.join(root, n) for n in names if os.path.isdir(os.path.join(root, n))
+    ]
 
 
 def cmd_kill(argv):
@@ -1727,7 +1858,7 @@ def cmd_kill(argv):
             try:
                 results[job_dir] = kill_job(job_dir)
             except CommandError as exc:
-                results[job_dir] = "job: %s\nerror: %s\n" % (os.path.basename(job_dir), exc)
+                results[job_dir] = f"job: {os.path.basename(job_dir)}\nerror: {exc}\n"
 
         threads = [threading.Thread(target=kill_one, args=(d,)) for d in running]
         for thread in threads:
@@ -1735,7 +1866,11 @@ def cmd_kill(argv):
         for thread in threads:
             thread.join()
         sys.stdout.write("".join(results[d] for d in running))
-        return EXIT_FAIL if any("\nerror: " in out for out in results.values()) else EXIT_OK
+        return (
+            EXIT_FAIL
+            if any("\nerror: " in out for out in results.values())
+            else EXIT_OK
+        )
     job_dir = find_job(one_name(args, "kill"))
     sys.stdout.write(kill_job(job_dir))
     return EXIT_OK
@@ -1768,13 +1903,16 @@ def cmd_status(argv):
         ("session_file", sessions[-1] if sessions else "-"),
         (
             "session_cmd",
-            "cd %s && pi --session-dir %s --session-id %s"
-            % (shlex.quote(job.get("cwd", ".")), shlex.quote(session_dir), shlex.quote(name)),
+            "cd {} && pi --session-dir {} --session-id {}".format(
+                shlex.quote(job.get("cwd", ".")),
+                shlex.quote(session_dir),
+                shlex.quote(name),
+            ),
         ),
     ]
     if status == "running":
         lines.append(("note", "open the session in pi only after the job stops"))
-    sys.stdout.write("".join("%s: %s\n" % pair for pair in lines))
+    sys.stdout.write("".join("{}: {}\n".format(*pair) for pair in lines))
     return EXIT_OK
 
 
@@ -1782,7 +1920,7 @@ def cmd_peek(argv):
     args = Args(argv, ("-n",), ())
     count = args.values.get("-n", "20")
     if not count.isdigit():
-        raise usage_error("-n needs a whole number of lines, got: %s" % count)
+        raise usage_error(f"-n needs a whole number of lines, got: {count}")
     job_dir = find_job(one_name(args, "peek"))
     lines = (read_text(job_path(job_dir, "progress.log"), "") or "").splitlines()
     tail = lines[-int(count) :] if int(count) else []
@@ -1802,7 +1940,11 @@ def cmd_list(argv):
         started = parse_utc(read_text(job_path(job_dir, "started_at"), "") or "")
         ended = parse_utc(read_text(job_path(job_dir, "ended_at"), "") or "")
         since = started if status == "running" else (ended or started)
-        if "--all" not in args.flags and status != "running" and (since is None or now - since > RECENT_S):
+        if (
+            "--all" not in args.flags
+            and status != "running"
+            and (since is None or now - since > RECENT_S)
+        ):
             continue
         rows.append(
             (
@@ -1831,12 +1973,16 @@ def cmd_profiles(argv):
     if args.positional:
         raise usage_error("profiles takes no arguments")
     profiles = sorted(
-        (p for p in load_profiles(logical_cwd()).values() if p["enabled"]), key=lambda p: p["name"].lower()
+        (p for p in load_profiles(logical_cwd()).values() if p["enabled"]),
+        key=lambda p: p["name"].lower(),
     )
     for profile in profiles:
         sys.stdout.write(
-            "%s\n  description: %s\n  source: %s\n"
-            % (profile["name"], " ".join(profile["description"].split()), profile["source"])
+            "{}\n  description: {}\n  source: {}\n".format(
+                profile["name"],
+                " ".join(profile["description"].split()),
+                profile["source"],
+            )
         )
     if not profiles:
         sys.stdout.write("no profiles found\n")
@@ -1846,7 +1992,7 @@ def cmd_profiles(argv):
 def cmd_rm(argv):
     job_dir = find_job(one_name(Args(argv, (), ()), "rm"))
     name = os.path.basename(job_dir)
-    lock_fd = job_lock(job_dir, "job %s is running; kill it first" % name)
+    lock_fd = job_lock(job_dir, f"job {name} is running; kill it first")
     try:
         job = read_json(job_path(job_dir, "job.json"), {})
         for path in find_session_file(job.get("session_dir", ""), name):
@@ -1855,7 +2001,7 @@ def cmd_rm(argv):
         shutil.rmtree(job_dir, ignore_errors=True)
     finally:
         os.close(lock_fd)
-    sys.stdout.write("removed: %s\n" % name)
+    sys.stdout.write(f"removed: {name}\n")
     return EXIT_OK
 
 
@@ -1890,12 +2036,12 @@ def main(argv):
         return cmd_runner(rest)
     handler = COMMANDS.get(command)
     if handler is None:
-        note("unknown command: %s (try --help)" % command)
+        note(f"unknown command: {command} (try --help)")
         return EXIT_USAGE
     try:
         return handler(rest)
     except CommandError as exc:
-        note("error: %s" % exc)
+        note(f"error: {exc}")
         return exc.code
 
 

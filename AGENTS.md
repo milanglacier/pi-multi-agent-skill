@@ -39,6 +39,15 @@ job's result under a name. Keep new features at that size:
 - Stdlib only, Python 3.9 or later.
 
 
+After changing Python code, including tests, run these commands from the
+repo root and fix any failures:
+
+```sh
+uvx ruff check .
+uvx ruff format --check .
+python3 -m unittest discover tests
+```
+
 # Notes and Rabbit Holes
 
 Knowledge the code does not show. When adding a note, describe the problem
