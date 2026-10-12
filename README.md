@@ -89,6 +89,14 @@ python3 -m unittest discover tests
 
 The tests use an offline stand-in for pi, so they call no model.
 
+## Releases
+
+Set the version in `package.json`, commit it, and push a matching tag such
+as `v0.1.1`. The GitHub workflow runs the tests and publishes to npm.
+Prerelease versions use the `next` npm tag; stable versions use `latest`.
+The npm trusted publisher is `milanglacier/pi-multi-agent-skill` with the
+workflow filename `publish.yml` and permission to publish directly.
+
 ## License
 
 MIT
