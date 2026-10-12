@@ -69,6 +69,25 @@ Requirements: pi and Python 3.9 or later. Nothing else to install.
 - **Works outside pi.** Claude Code, Codex or any other agent with a shell
   can run the same commands to delegate work to pi agents.
 
+## Non-goals
+
+These are deliberate non-goals, to keep the skill small and free of bloat.
+Each is better as a separate extension or skill that you pick to match your
+own workflow. This follows the minimalism of pi itself and the Unix
+philosophy: do one thing well and compose.
+
+- **Memory.** Agents do not share or keep memory between jobs. Use a memory
+  extension, or have agents write notes to files.
+- **Scheduling.** There are no cron-style or recurring agents. Use cron,
+  `systemd` timers or a scheduler extension to run the commands.
+- **Worktrees.** Agents are not isolated in git worktrees. Just prompt the
+  agent to use a worktree.
+- **Dynamic workflows.** There is no scripting layer for orchestration such
+  as pipelines, parallel fan-out with gates, or phases. Your agent can
+  already start, wait for and chain jobs with plain commands. For
+  deterministic scripts, use an extension such as
+  [pi-dynamic-workflow](https://github.com/milanglacier/pi-dynamic-workflow).
+
 ## Usage
 
 Your agent drives the skill on its own, but the commands also work by hand:
