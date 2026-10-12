@@ -1,6 +1,6 @@
 ---
 name: multi-agent
-description: Delegate work to other agents. Use it when a task benefits from a multi-agent workflow, such as splitting work across agents, running it in parallel or in the background, or keeping a side task out of your own context.
+description: Start other pi agents and delegate work to them. Use it when a task benefits from a multi-agent workflow, such as splitting work across agents, running it in parallel or in the background, or keeping a side task out of your own context.
 ---
 
 # Multi-agent
