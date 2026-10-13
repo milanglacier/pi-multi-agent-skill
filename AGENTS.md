@@ -39,6 +39,9 @@ job's result under a name. Keep new features at that size:
 - Stdlib only, Python 3.9 or later.
 
 
+After changing SKILL.md or the references, run
+`python3 scripts/count_tokens.py` to check token counts.
+
 After changing Python code, including tests, run these commands from the
 repo root and fix any failures:
 
