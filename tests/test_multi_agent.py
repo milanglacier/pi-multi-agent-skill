@@ -7,6 +7,7 @@ directories is touched.
 
 import glob
 import importlib.util
+import io
 import json
 import os
 import shlex
@@ -450,6 +451,33 @@ class NamesAndStateTest(Base):
             ma.job_lock(job_dir, "busy")
         self.assertIn("was removed", str(ctx.exception))
 
+    def test_conflict_without_timestamps(self):
+        self.make_job("untimed")
+        result = self.cli("run", "--name", "untimed", "x")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("(died); pick another --name.", result.stderr)
+        self.assertFalse(self.records("start"))
+
+    def test_rm_all_when_a_job_starts(self):
+        busy = self.make_job("a-busy", status="done\n", exit_code="0\n")
+        finished = self.make_job("z-done", status="done\n", exit_code="0\n")
+        holder = ma.job_lock(busy, "busy")
+        self.addCleanup(os.close, holder)
+        output = io.StringIO()
+        with (
+            mock.patch.object(ma, "logical_cwd", return_value=self.project),
+            mock.patch.object(ma, "job_state", return_value="done"),
+            mock.patch.object(ma, "LOCK_TIMEOUT_S", 0.01),
+            mock.patch.object(ma.sys, "stdout", output),
+        ):
+            self.assertEqual(ma.cmd_rm(["--all"]), 1)
+        self.assertEqual(
+            output.getvalue(),
+            "error: job a-busy is running; kill it first\nremoved: z-done\n",
+        )
+        self.assertTrue(os.path.isdir(busy))
+        self.assertFalse(os.path.exists(finished))
+
     def test_socket_path(self):
         job_dir = os.path.join(ma.jobs_dir(self.project), "x")
         path = ma.socket_path(job_dir)
@@ -773,11 +801,33 @@ class ForegroundTest(Base):
         self.assertFalse(self.records("start"))
 
     def test_existing_name_is_refused(self):
-        self.cli("run", "--name", "dup", "x")
+        self.assertEqual(self.cli("run", "--name", "dup", "x").returncode, 0)
+        ended = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 3 * 86400)
+        )
+        ma.write_atomic(os.path.join(self.job_dir("dup"), "ended_at"), ended + "\n")
         result = self.cli("run", "--name", "dup", "y")
         self.assertEqual(result.returncode, 1)
-        self.assertIn("resume", result.stderr)
-        self.assertIn("rm dup", result.stderr)
+        self.assertIn("(done, ended 3d ago); pick another --name.", result.stderr)
+        guidance = "Run `resume dup` or `rm dup` only for a job you started or the user asked about."
+        self.assertIn(guidance, result.stderr)
+        self.assertEqual(len(self.records("start")), 1)
+
+        hold, release = self.hold()
+        self.run_bg("busy-dup", env=hold)
+        wait_until(lambda: len(self.records("start")) == 2)
+        result = self.cli("run", "--name", "busy-dup", "y")
+        self.assertEqual(result.returncode, 1)
+        self.assertRegex(
+            result.stderr, r"\(running, started \d+s ago\); pick another --name\."
+        )
+        self.assertIn(
+            "Run `resume busy-dup` or `rm busy-dup` only for a job you started or the user asked about.",
+            result.stderr,
+        )
+        self.assertEqual(len(self.records("start")), 2)
+        release()
+        self.assertEqual(self.cli("wait", "busy-dup").returncode, 0)
 
     def test_signals_stop_the_run(self):
         for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
@@ -1221,6 +1271,66 @@ class KillTest(Base):
         result = self.cli("rm", "rm-died")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(os.path.exists(sock))
+
+    def test_rm_all(self):
+        self.assertEqual(
+            self.cli("rm", "--all").stdout, "no jobs to remove in this project\n"
+        )
+        self.assertEqual(self.cli("run", "--name", "rm-done", "x").returncode, 0)
+        self.assertEqual(
+            self.cli(
+                "run", "--name", "rm-failed", "x", env={"FAKE_PI_EXIT_EARLY": "1"}
+            ).returncode,
+            1,
+        )
+        done_dir = self.job_dir("rm-done")
+        failed_dir = self.job_dir("rm-failed")
+        session_dir = json.loads(self.state("rm-done", "job.json"))["session_dir"]
+        sessions = [
+            path
+            for name in ("rm-done", "rm-failed")
+            for path in ma.find_session_file(session_dir, name)
+        ]
+        self.assertEqual(len(sessions), 2)
+        other = os.path.join(self.tmp, "other-project")
+        os.makedirs(other)
+        self.assertEqual(
+            self.cli("run", "--name", "rm-done", "x", cwd=other).returncode, 0
+        )
+        other_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(done_dir))),
+            ma.project_slug(other),
+            "jobs",
+            "rm-done",
+        )
+        other_sessions = ma.find_session_file(
+            json.loads(ma.read_text(os.path.join(other_dir, "job.json")))[
+                "session_dir"
+            ],
+            "rm-done",
+        )
+        self.assertEqual(len(other_sessions), 1)
+        hold, release = self.hold()
+        self.run_bg("rm-running", env=hold)
+        running_dir = self.job_dir("rm-running")
+
+        result = self.cli("rm", "--all", "rm-done")
+        self.assertEqual(result.returncode, 64)
+        self.assertIn("rm takes a job name or --all, not both", result.stderr)
+        self.assertTrue(os.path.isdir(done_dir))
+        result = self.cli("rm", "--all")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "removed: rm-done\nremoved: rm-failed\n")
+        for path in (done_dir, failed_dir, *sessions):
+            self.assertFalse(os.path.exists(path), path)
+        for path in (running_dir, other_dir, *other_sessions):
+            self.assertTrue(os.path.exists(path), path)
+        self.assertEqual(ma.job_state(running_dir), "running")
+        result = self.cli("rm", "--all")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "no jobs to remove in this project\n")
+        release()
+        self.assertEqual(self.cli("wait", "rm-running").returncode, 0)
 
     def test_stuck_runner(self):
         self.run_bg("stuck", env={"FAKE_PI_DELAY": "60"})

@@ -112,7 +112,7 @@ Usage:
   multi_agent.py peek     NAME [-n N]
   multi_agent.py list     [--all]
   multi_agent.py profiles
-  multi_agent.py rm       NAME
+  multi_agent.py rm       (NAME | --all)
 
 Options for run:
   --profile P     Profile name, matched case-insensitively (default general-purpose)
@@ -581,6 +581,15 @@ def job_state(job_dir):
     finally:
         if fd is not None:
             os.close(fd)
+
+
+def job_since(job_dir, status):
+    """Return the time used for the job's age, or None when it is missing."""
+    started = parse_utc(read_text(job_path(job_dir, "started_at"), "") or "")
+    if status == "running":
+        return started
+    ended = parse_utc(read_text(job_path(job_dir, "ended_at"), "") or "")
+    return ended or started
 
 
 def socket_path(job_dir):
@@ -1576,9 +1585,16 @@ def cmd_run(argv):
         try:
             os.mkdir(os.path.join(root, name))
         except FileExistsError:
+            job_dir = os.path.join(root, name)
+            status = job_state(job_dir)
+            since = job_since(job_dir, status)
+            detail = status
+            if since is not None:
+                event = "started" if status == "running" else "ended"
+                detail += f", {event} {format_age(time.time() - since)} ago"
             raise CommandError(
-                f"job {name} already exists in this project; use `resume {name}` to continue it, pick"
-                f" another --name, or `rm {name}` first"
+                f"job {name} already exists in this project ({detail}); pick another --name. "
+                f"Run `resume {name}` or `rm {name}` only for a job you started or the user asked about."
             )
     else:
         for _attempt in range(100):
@@ -1938,8 +1954,7 @@ def cmd_list(argv):
         job = read_json(job_path(job_dir, "job.json"), {})
         status = job_state(job_dir)
         started = parse_utc(read_text(job_path(job_dir, "started_at"), "") or "")
-        ended = parse_utc(read_text(job_path(job_dir, "ended_at"), "") or "")
-        since = started if status == "running" else (ended or started)
+        since = job_since(job_dir, status)
         if (
             "--all" not in args.flags
             and status != "running"
@@ -1989,8 +2004,7 @@ def cmd_profiles(argv):
     return EXIT_OK
 
 
-def cmd_rm(argv):
-    job_dir = find_job(one_name(Args(argv, (), ()), "rm"))
+def remove_job(job_dir):
     name = os.path.basename(job_dir)
     lock_fd = job_lock(job_dir, f"job {name} is running; kill it first")
     try:
@@ -2002,6 +2016,26 @@ def cmd_rm(argv):
     finally:
         os.close(lock_fd)
     sys.stdout.write(f"removed: {name}\n")
+
+
+def cmd_rm(argv):
+    args = Args(argv, (), ("--all",))
+    if "--all" in args.flags:
+        if args.positional:
+            raise usage_error("rm takes a job name or --all, not both")
+        finished = [d for d in project_jobs(logical_cwd()) if job_state(d) != "running"]
+        if not finished:
+            sys.stdout.write("no jobs to remove in this project\n")
+            return EXIT_OK
+        code = EXIT_OK
+        for job_dir in finished:
+            try:
+                remove_job(job_dir)
+            except CommandError as exc:
+                sys.stdout.write(f"error: {exc}\n")
+                code = EXIT_FAIL
+        return code
+    remove_job(find_job(one_name(args, "rm")))
     return EXIT_OK
 
 

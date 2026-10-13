@@ -17,12 +17,12 @@ An empty prompt or message is a usage error. `--help` prints a usage summary.
 | `peek NAME [-n N]` | Print the last N lines (default 20) of the job's progress log. |
 | `list [--all]` | List the jobs of the current project. |
 | `profiles` | List the available profiles. |
-| `rm NAME` | Delete a job that is not running, with its conversation. |
+| `rm NAME` / `rm --all` | Delete one job that is not running, or every such job of the current project, with their conversations. |
 
 ## Projects and job names
 
 A job belongs to the project of the directory where `run` was called. `run`,
-`list` and `kill --all` work on the current directory's project only.
+`list`, `kill --all` and `rm --all` work on the current directory's project only.
 
 The other commands look for NAME in the current project first. If the project
 has no job of that name, they search every project and use the job when
@@ -45,8 +45,9 @@ run it from the job's project.
 
 A job name contains letters, digits, `.`, `_` and `-`, starts and ends with a
 letter or digit, and has at most 64 characters. `run` refuses a name that
-already exists in the project; `resume` that job, pick another name, or `rm`
-the old job first.
+already exists in the project and reports its status and age. Pick another
+`--name`. Use `resume` or `rm` only for a job you started or the user asked
+about.
 
 `--cwd` changes where the agent works and where project profiles are looked
 up (`DIR/.pi/agents/`). The job still belongs to the current directory's
@@ -197,9 +198,12 @@ It looks up project profiles in the current directory.
 
 ## rm
 
-`rm` deletes a job that is not running: its state directory and its
+`rm NAME` deletes a job that is not running: its state directory and its
 conversation file. It prints `removed: NAME` and fails with `job NAME is
 running; kill it first` while the job runs.
+
+`rm --all` deletes every job of the current project that is not running,
+with its conversation, and leaves running jobs alone.
 
 ## Exit codes
 

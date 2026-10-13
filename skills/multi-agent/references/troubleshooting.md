@@ -25,8 +25,9 @@
 
 - **`job is not running; use resume`.** The run has ended or is ending.
   `resume` the job with a new prompt instead of steering it.
-- **`job NAME already exists in this project`.** `run` needs a new name.
-  `resume` the job, pick another `--name`, or `rm` the old job first.
+- **`job NAME already exists in this project`.** Pick another `--name`.
+  The error shows the existing job's status and age. Use `resume` or `rm`
+  only for a job you started or the user asked about.
 - **`job NAME is running` from `resume` or `rm`.** The job's runner is
   still alive, or another command was starting the job at the same moment.
   `wait` for it, or `kill` it first.
