@@ -105,21 +105,33 @@ See [`skills/multi-agent/references/`](skills/multi-agent/references/) for
 every command and option, how jobs start and stop, the profile format, where
 state is kept and troubleshooting.
 
-## Tests
+## Profiles
 
-```bash
-python3 -m unittest discover tests
+A profile is a Markdown file with frontmatter that sets an agent's system
+prompt, model, thinking level and tools. `--profile NAME` selects one;
+`multi_agent.py profiles` lists the available ones.
+
+```markdown
+---
+model: anthropic/claude-sonnet-5
+thinking: high
+tools: read, grep, find
+---
+You review code changes and report bugs.
 ```
 
-The tests use an offline stand-in for pi, so they call no model.
-
-## Releases
-
-Set the version in `package.json`, commit it, and push a matching tag such
-as `v0.1.1`. The GitHub workflow runs the tests and publishes to npm.
-Prerelease versions use the `next` npm tag; stable versions use `latest`.
-The npm trusted publisher is `milanglacier/pi-multi-agent-skill` with the
-workflow filename `publish.yml` and permission to publish directly.
+Profiles are looked up in `<cwd>/.pi/agents/*.md`, then
+`$PI_CODING_AGENT_DIR/agents/*.md` (`~/.pi/agent/agents/` by default); when
+names collide, the local profile wins. Two profiles are built in:
+`general-purpose` (the default) and `Explore`, a read-only search agent.
+Supported fields are `name`, `description`, `model`, `thinking`, `tools`,
+`disallowed_tools`, `prompt_mode` and `enabled`. Fields do not merge across
+files, so a local profile replaces the profile it overrides as a whole and
+must supply the entire profile; `enabled: false` is the exception and hides
+the name on its own. Unknown fields are ignored, and nested YAML is not
+supported. See
+[`references/profiles.md`](skills/multi-agent/references/profiles.md) for the
+field details.
 
 ## License
 
