@@ -53,12 +53,14 @@ Requirements: pi and Python 3.9 or later. Nothing else to install.
   them, `steer` one with a correction, `abort` it and keep what it has so
   far, `resume` a finished job with a follow-up task, and see what each job
   is doing. You can run the same commands yourself from a terminal.
-- **Parallel and background agents.** Run a quick question in the
-  foreground, or start several jobs at once and collect their results later.
-- **Stops when you stop.** A foreground agent ends when the command that
-  started it ends: press Esc, cancel the tool call or close the session, and
-  the agent and the commands it was running stop with it, at every level of
-  nesting. Background jobs keep running until they finish or time out.
+- **Foreground agents.** Run a quick question and wait for the answer. A
+  foreground agent is tied to the command that started it: press Esc, cancel
+  the tool call or close the session, and the agent and the commands it was
+  running stop with it, at every level of nesting.
+- **Parallel and background agents.** Start several jobs at once and collect
+  their results later. A background job is independent of your session: it
+  keeps running after the session that started it ends, until it finishes
+  or times out, and you can collect its result from a later session.
 - **Your full pi setup.** Each agent loads the same extensions, MCP servers,
   skills and settings as an interactive pi, and uses your model unless its
   profile picks another.
