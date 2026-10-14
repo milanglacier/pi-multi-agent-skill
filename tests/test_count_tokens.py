@@ -71,7 +71,11 @@ class CountTokensTests(unittest.TestCase):
 
     def git(self, *args):
         return subprocess.run(
-            ["git", *args], cwd=self.root, check=True, capture_output=True, text=True
+            ["git", "-c", "commit.gpgSign=false", *args],
+            cwd=self.root,
+            check=True,
+            capture_output=True,
+            text=True,
         ).stdout
 
     def run_main(self, *args):
@@ -101,6 +105,26 @@ class CountTokensTests(unittest.TestCase):
         self.assertEqual(count.call_count, 4)
         for call in count.call_args_list:
             self.assertEqual(call.args[1:], ("gpt-6-luna", "key"))
+
+    def test_empty_after_means_working_tree(self):
+        result, output, error, _ = self.run_main("--after", "")
+        self.assertEqual(result, 0, error)
+        self.assertIn("Before: HEAD; after: working tree", output)
+        self.assert_comparison(output)
+
+    def test_missing_api_key_skips_without_requests(self):
+        with (
+            patch.dict(count_tokens.os.environ, {"OPENAI_API_KEY": ""}),
+            patch.object(count_tokens.sys, "argv", ["count_tokens.py"]),
+            patch.object(count_tokens, "count_tokens") as count,
+            patch("sys.stdout", new_callable=io.StringIO) as output,
+            patch("sys.stderr", new_callable=io.StringIO) as error,
+        ):
+            result = count_tokens.main()
+        self.assertEqual(result, 0)
+        self.assertIn("OPENAI_API_KEY is not set", output.getvalue())
+        self.assertEqual(error.getvalue(), "")
+        count.assert_not_called()
 
     def test_compare_git_refs(self):
         self.git("add", ".")

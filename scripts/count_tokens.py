@@ -72,16 +72,18 @@ def main() -> int:
         "--before", default="HEAD", help="Git ref to compare from (default: HEAD)."
     )
     parser.add_argument(
-        "--after", help="Git ref to compare to (default: current working tree)."
+        "--after",
+        help="Git ref to compare to (default and empty value: current working tree).",
     )
     args = parser.parse_args()
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        parser.error("OPENAI_API_KEY must be set.")
+        print("OPENAI_API_KEY is not set; skipping token counts.", flush=True)
+        return 0
 
     try:
         before = read_files(args.before)
-        after = read_files(args.after)
+        after = read_files(args.after or None)
     except (OSError, ValueError) as error:
         print(str(error), file=sys.stderr)
         return 1
