@@ -39,17 +39,12 @@ job's result under a name. Keep new features at that size:
 - Stdlib only, Python 3.9 or later.
 
 
-After changing SKILL.md or the references, run
-`python3 scripts/count_tokens.py` to check token counts.
+After changing SKILL.md or the references, run `make token-count` from the
+repo root to check token counts.
 
-After changing Python code, including tests, run these commands from the
-repo root and fix any failures:
-
-```sh
-uvx ruff check .
-uvx ruff format --check .
-python3 -m unittest discover tests
-```
+After changing Python code, including tests, run `make check` from the
+repo root and fix any failures. Run `make check-full` before committing to
+also test Python 3.9.
 
 # Notes and Rabbit Holes
 
@@ -74,6 +69,5 @@ and the outcome to preserve, not a step-by-step patch.
 - **Accepted limits.** SIGKILL to a runner orphans its pi for a few seconds.
   A stuck runner is not killed automatically. An `abort` that reaches pi
   before the agent starts is ignored until the settle deadline.
-- **Tests.** Run the suite on Python 3.9 too (`uv run --no-project --python
-  3.9 python -m unittest discover tests`), one suite at a time: parallel
-  suites can make the signal tests fail.
+- **Tests.** `make check` runs the suite on the current Python.
+  `make check-full` also runs it on Python 3.9.
