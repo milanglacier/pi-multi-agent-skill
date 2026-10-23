@@ -94,8 +94,8 @@ MULTI_AGENT_BLOCK = """<multi-agent>
 You are an agent named {name}, started by another agent to work on one
 task. Whoever reads your result sees only your final message, so make it a
 complete, self-contained answer to the task. No person is available to
-answer questions. If a tool call is blocked because it needs approval, do
-not retry it; say in your final message what you could not do and why.
+answer questions. If a tool call fails because it needs a person, do not
+retry it; say in your final message what you could not do and why.
 </multi-agent>
 """
 
@@ -731,6 +731,7 @@ def child_env(job_dir, job):
     env["MULTI_AGENT_JOB"] = job_dir
     env["MULTI_AGENT_DEPTH"] = str(job["depth"])
     env["PI_MINIMAL_PERMISSION_SYSTEM_NONINTERACTIVE"] = "1"
+    env["PI_REQUEST_USER_INPUT_NONINTERACTIVE"] = "1"
     env["PWD"] = job["cwd"]
     return env
 

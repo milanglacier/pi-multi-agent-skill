@@ -45,7 +45,13 @@ import time
 
 ENV = os.environ.get
 RECORD_DIR = ENV("FAKE_PI_RECORD_DIR")
-RECORDED_ENV_PREFIXES = ("MULTI_AGENT_", "PI_MINIMAL_PERMISSION_SYSTEM_", "HERDR_", "PWD")
+RECORDED_ENV_PREFIXES = (
+    "MULTI_AGENT_",
+    "PI_MINIMAL_PERMISSION_SYSTEM_",
+    "PI_REQUEST_USER_INPUT_",
+    "HERDR_",
+    "PWD",
+)
 DIALOG_METHODS = ("select", "confirm", "input", "editor")
 
 

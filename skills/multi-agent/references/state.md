@@ -52,4 +52,5 @@ An agent inherits the environment of the command that started it, plus:
 | `MULTI_AGENT_JOB` | The agent's job directory. |
 | `MULTI_AGENT_DEPTH` | The agent's nesting depth; see `lifecycle.md`. |
 | `PI_MINIMAL_PERMISSION_SYSTEM_NONINTERACTIVE` | `1`, so that extension never waits for an approval. |
+| `PI_REQUEST_USER_INPUT_NONINTERACTIVE` | `1`, so that extension never asks the user a question. |
 | `PWD` | The agent's working directory. |

@@ -74,10 +74,10 @@ the next run.
 
 No person watches an agent. When an extension inside the agent opens a dialog
 (select, confirm, input or editor), it is cancelled at once and logged in the
-progress log as `denied:`. The pi-minimal-permission-system extension, if
-installed, runs in its non-interactive mode, so tool calls that need approval
-are blocked. The agent is told not to retry them and to report what it could not do in its final
-message.
+progress log as `denied:`. Extensions that have a non-interactive mode run in
+it (see `state.md`), so tool calls that need a person fail without opening a
+dialog. The agent is told not to retry them and to report what it could not
+do in its final message.
 
 ## Nesting
 

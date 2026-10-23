@@ -625,6 +625,7 @@ class ForegroundTest(Base):
         self.assertEqual(env["MULTI_AGENT_JOB"], job_dir)
         self.assertEqual(env["MULTI_AGENT_DEPTH"], "1")
         self.assertEqual(env["PI_MINIMAL_PERMISSION_SYSTEM_NONINTERACTIVE"], "1")
+        self.assertEqual(env["PI_REQUEST_USER_INPUT_NONINTERACTIVE"], "1")
         self.assertFalse([k for k in env if k.startswith("HERDR_")])
         # pi leads its own session, apart from the runner's process group.
         self.assertEqual(start["sid"], start["pid"])
