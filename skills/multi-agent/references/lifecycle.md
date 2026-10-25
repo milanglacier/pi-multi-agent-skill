@@ -81,12 +81,12 @@ do in its final message.
 
 ## Nesting
 
-An agent can start agents of its own. `MULTI_AGENT_DEPTH` counts the depth: 0
-or unset for the user's agent, 1 for an agent it started, and so on. `run` and
+An agent can start agents of its own. `PI_MULTI_AGENT_DEPTH` counts the depth:
+0 or unset for the user's agent, 1 for an agent it started, and so on. `run` and
 `resume` refuse to start when the caller's depth is at least
-`MULTI_AGENT_MAX_DEPTH` (default 2), so by default the user's agent and its
+`PI_MULTI_AGENT_MAX_DEPTH` (default 2), so by default the user's agent and its
 agents can delegate, and their agents cannot. Agents inherit
-`MULTI_AGENT_MAX_DEPTH` from the environment of the user's agent.
+`PI_MULTI_AGENT_MAX_DEPTH` from the environment of the user's agent.
 
-`MULTI_AGENT_JOB` holds the job directory of the agent that is running.
+`PI_MULTI_AGENT_JOB` holds the job directory of the agent that is running.
 `status` and `list` use it to show the job that started each job.

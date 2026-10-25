@@ -53,14 +53,14 @@ NOT_RUNNING = "job is not running; use resume"
 
 def time_scale():
     """The factor for the timing constants below; tests set it to make them short."""
-    value = os.environ.get("MULTI_AGENT_TIME_SCALE") or "1"
+    value = os.environ.get("PI_MULTI_AGENT_TIME_SCALE") or "1"
     try:
         scale = float(value)
     except ValueError:
         scale = 0.0
     if not 0 < scale < float("inf"):
         raise SystemExit(
-            f"multi-agent: error: MULTI_AGENT_TIME_SCALE needs a positive number, got: {value}"
+            f"multi-agent: error: PI_MULTI_AGENT_TIME_SCALE needs a positive number, got: {value}"
         )
     return scale
 
@@ -273,14 +273,14 @@ def sessions_dir(project):
 
 
 def pi_bin():
-    return os.environ.get("MULTI_AGENT_PI_BIN") or "pi"
+    return os.environ.get("PI_MULTI_AGENT_PI_BIN") or "pi"
 
 
 def check_pi_bin():
     if not shutil.which(pi_bin()):
         raise CommandError(
             f'cannot find the pi program "{pi_bin()}"; '
-            "set MULTI_AGENT_PI_BIN to the command that starts pi"
+            "set PI_MULTI_AGENT_PI_BIN to the command that starts pi"
         )
 
 
@@ -736,8 +736,8 @@ def child_env(job_dir, job):
     env = dict(os.environ)
     for key in REMOVED_ENV:
         env.pop(key, None)
-    env["MULTI_AGENT_JOB"] = job_dir
-    env["MULTI_AGENT_DEPTH"] = str(job["depth"])
+    env["PI_MULTI_AGENT_JOB"] = job_dir
+    env["PI_MULTI_AGENT_DEPTH"] = str(job["depth"])
     env["PI_MINIMAL_PERMISSION_SYSTEM_NONINTERACTIVE"] = "1"
     env["PI_REQUEST_USER_INPUT_NONINTERACTIVE"] = "1"
     env["PWD"] = job["cwd"]
@@ -1327,7 +1327,7 @@ def run_runner(job_dir, lock_fd, server, caller_fd=None):
 
 def caller_depth():
     try:
-        return int(os.environ.get("MULTI_AGENT_DEPTH") or 0)
+        return int(os.environ.get("PI_MULTI_AGENT_DEPTH") or 0)
     except ValueError:
         return 0
 
@@ -1335,12 +1335,12 @@ def caller_depth():
 def check_depth():
     depth = caller_depth()
     try:
-        limit = int(os.environ.get("MULTI_AGENT_MAX_DEPTH") or DEFAULT_MAX_DEPTH)
+        limit = int(os.environ.get("PI_MULTI_AGENT_MAX_DEPTH") or DEFAULT_MAX_DEPTH)
     except ValueError:
         limit = DEFAULT_MAX_DEPTH
     if depth >= limit:
         raise CommandError(
-            f"cannot start an agent: this caller is at depth {depth} and MULTI_AGENT_MAX_DEPTH is {limit}"
+            f"cannot start an agent: this caller is at depth {depth} and PI_MULTI_AGENT_MAX_DEPTH is {limit}"
         )
     return depth + 1
 
@@ -1639,7 +1639,7 @@ def cmd_run(argv):
             "cwd": cwd,
             "project": project,
             "session_dir": session_dir,
-            "parent": os.environ.get("MULTI_AGENT_JOB") or None,
+            "parent": os.environ.get("PI_MULTI_AGENT_JOB") or None,
             "depth": depth,
             "model": model,
             "thinking": thinking,

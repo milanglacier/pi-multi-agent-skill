@@ -36,7 +36,7 @@
 - **`--fork needs PI_SESSION_FILE`.** The command does not run inside pi, so
   there is no conversation to copy. Drop `--fork` and write a self-contained
   prompt.
-- **`cannot start an agent: ... MULTI_AGENT_MAX_DEPTH`.** The caller is too
+- **`cannot start an agent: ... PI_MULTI_AGENT_MAX_DEPTH`.** The caller is too
   deep in a chain of agents. Do the work directly.
 - **`the runner of job NAME is not responding`.** The runner did not answer
   `kill` within 10 seconds, or did not exit within 20 seconds after it
@@ -49,7 +49,7 @@
 
 ## Environment
 
-- **`cannot find the pi program`.** Set `MULTI_AGENT_PI_BIN` to the command
+- **`cannot find the pi program`.** Set `PI_MULTI_AGENT_PI_BIN` to the command
   that starts pi, such as `pi-bolt`, or ask the user which one they use.
 - **`flock does not work on ...`.** The state directory is on a file system
   without working file locks, such as some NFS or SMB mounts. Set

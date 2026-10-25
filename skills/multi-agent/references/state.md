@@ -45,13 +45,13 @@ because two processes would then write the same session file.
 
 ## The agent's environment
 
-The script starts the program in `MULTI_AGENT_PI_BIN` (default `pi`). An
+The script starts the program in `PI_MULTI_AGENT_PI_BIN` (default `pi`). An
 agent inherits the environment of the command that started it, plus:
 
 | Variable | Value |
 |---|---|
-| `MULTI_AGENT_JOB` | The agent's job directory. |
-| `MULTI_AGENT_DEPTH` | The agent's nesting depth; see `lifecycle.md`. |
+| `PI_MULTI_AGENT_JOB` | The agent's job directory. |
+| `PI_MULTI_AGENT_DEPTH` | The agent's nesting depth; see `lifecycle.md`. |
 | `PI_MINIMAL_PERMISSION_SYSTEM_NONINTERACTIVE` | `1`, so that extension never waits for an approval. |
 | `PI_REQUEST_USER_INPUT_NONINTERACTIVE` | `1`, so that extension never asks the user a question. |
 | `PWD` | The agent's working directory. |

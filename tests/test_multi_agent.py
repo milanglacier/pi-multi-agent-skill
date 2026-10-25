@@ -28,7 +28,7 @@ FAKE_PI = os.path.join(HERE, "fake-pi")
 # run and in `ma` below, so tests that wait them out stay short. Tests compute
 # their expectations from the scaled constants, such as ma.PI_EXIT_GRACE_S.
 TIME_SCALE = "0.1"
-os.environ["MULTI_AGENT_TIME_SCALE"] = TIME_SCALE
+os.environ["PI_MULTI_AGENT_TIME_SCALE"] = TIME_SCALE
 
 _spec = importlib.util.spec_from_file_location("multi_agent", SCRIPT)
 ma = importlib.util.module_from_spec(_spec)
@@ -83,14 +83,14 @@ class Base(unittest.TestCase):
         env = {
             k: v
             for k, v in os.environ.items()
-            if not k.startswith(("MULTI_AGENT_", "FAKE_PI_", "PI_", "HERDR_"))
+            if not k.startswith(("FAKE_PI_", "PI_", "HERDR_"))
         }
         env.update(
             {
                 "XDG_STATE_HOME": os.path.join(self.tmp, "state"),
                 "PI_CODING_AGENT_DIR": self.agent_dir,
-                "MULTI_AGENT_PI_BIN": FAKE_PI,
-                "MULTI_AGENT_TIME_SCALE": TIME_SCALE,
+                "PI_MULTI_AGENT_PI_BIN": FAKE_PI,
+                "PI_MULTI_AGENT_TIME_SCALE": TIME_SCALE,
                 "FAKE_PI_RECORD_DIR": self.record,
                 "PWD": self.project,
                 "HERDR_ENV": "1",
@@ -622,8 +622,8 @@ class ForegroundTest(Base):
         )
 
         env = start["env"]
-        self.assertEqual(env["MULTI_AGENT_JOB"], job_dir)
-        self.assertEqual(env["MULTI_AGENT_DEPTH"], "1")
+        self.assertEqual(env["PI_MULTI_AGENT_JOB"], job_dir)
+        self.assertEqual(env["PI_MULTI_AGENT_DEPTH"], "1")
         self.assertEqual(env["PI_MINIMAL_PERMISSION_SYSTEM_NONINTERACTIVE"], "1")
         self.assertEqual(env["PI_REQUEST_USER_INPUT_NONINTERACTIVE"], "1")
         self.assertFalse([k for k in env if k.startswith("HERDR_")])
@@ -655,19 +655,21 @@ class ForegroundTest(Base):
             "--name",
             "child",
             "x",
-            env={"MULTI_AGENT_JOB": parent, "MULTI_AGENT_DEPTH": "1"},
+            env={"PI_MULTI_AGENT_JOB": parent, "PI_MULTI_AGENT_DEPTH": "1"},
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.start_record()["env"]["MULTI_AGENT_DEPTH"], "2")
+        self.assertEqual(self.start_record()["env"]["PI_MULTI_AGENT_DEPTH"], "2")
         self.assertIn("parent: parent-job", self.cli("status", "child").stdout)
 
     def test_depth_limit(self):
-        result = self.cli("run", "x", env={"MULTI_AGENT_DEPTH": "2"})
+        result = self.cli("run", "x", env={"PI_MULTI_AGENT_DEPTH": "2"})
         self.assertEqual(result.returncode, 1)
-        self.assertIn("MULTI_AGENT_MAX_DEPTH", result.stderr)
+        self.assertIn("PI_MULTI_AGENT_MAX_DEPTH", result.stderr)
         self.assertFalse(self.records("start"))
         result = self.cli(
-            "run", "x", env={"MULTI_AGENT_DEPTH": "2", "MULTI_AGENT_MAX_DEPTH": "3"}
+            "run",
+            "x",
+            env={"PI_MULTI_AGENT_DEPTH": "2", "PI_MULTI_AGENT_MAX_DEPTH": "3"},
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
@@ -713,18 +715,18 @@ class ForegroundTest(Base):
         self.assertIn("status: failed", result.stdout)
 
     def test_missing_pi(self):
-        missing = {"MULTI_AGENT_PI_BIN": "no-such-pi"}
+        missing = {"PI_MULTI_AGENT_PI_BIN": "no-such-pi"}
         result = self.cli("run", "--name", "nopi", "x", env=missing)
         self.assertEqual(result.returncode, 1)
         self.assertIn('cannot find the pi program "no-such-pi"', result.stderr)
-        self.assertIn("MULTI_AGENT_PI_BIN", result.stderr)
+        self.assertIn("PI_MULTI_AGENT_PI_BIN", result.stderr)
         self.assertFalse(
             glob.glob(os.path.join(self.tmp, "state", "*", "*", "jobs", "nopi"))
         )
         self.assertEqual(self.cli("run", "--name", "nopi", "x").returncode, 0)
         result = self.cli("resume", "nopi", "y", env=missing)
         self.assertEqual(result.returncode, 1)
-        self.assertIn("MULTI_AGENT_PI_BIN", result.stderr)
+        self.assertIn("PI_MULTI_AGENT_PI_BIN", result.stderr)
         session_cmd = f"{shlex.quote(FAKE_PI)} --session-dir"
         self.assertIn(session_cmd, self.cli("status", "nopi").stdout)
 
@@ -918,7 +920,7 @@ class ForegroundTest(Base):
         )
         pis = [record["pid"] for record in starts]
         inner_caller = self.records("tool")[0]["tool_pid"]
-        self.assertEqual(self.start_record()["env"]["MULTI_AGENT_DEPTH"], "2")
+        self.assertEqual(self.start_record()["env"]["PI_MULTI_AGENT_DEPTH"], "2")
         runners = [record["ppid"] for record in starts]
         os.killpg(caller.pid, signal.SIGKILL)
         for pid in pis + runners + [inner_caller]:
