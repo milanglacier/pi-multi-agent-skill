@@ -45,7 +45,8 @@ because two processes would then write the same session file.
 
 ## The agent's environment
 
-An agent inherits the environment of the command that started it, plus:
+The script starts the program in `MULTI_AGENT_PI_BIN` (default `pi`). An
+agent inherits the environment of the command that started it, plus:
 
 | Variable | Value |
 |---|---|

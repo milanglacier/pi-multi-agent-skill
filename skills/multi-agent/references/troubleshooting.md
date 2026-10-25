@@ -49,6 +49,8 @@
 
 ## Environment
 
+- **`cannot find the pi program`.** Set `MULTI_AGENT_PI_BIN` to the command
+  that starts pi, such as `pi-bolt`, or ask the user which one they use.
 - **`flock does not work on ...`.** The state directory is on a file system
   without working file locks, such as some NFS or SMB mounts. Set
   `XDG_STATE_HOME` to a directory on a local file system.

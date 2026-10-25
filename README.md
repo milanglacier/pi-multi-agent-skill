@@ -39,6 +39,14 @@ ln -s "$PWD/skills/multi-agent" ~/.pi/agent/skills/multi-agent
 
 Requirements: pi and Python 3.9 or later. Nothing else to install.
 
+Agents run `pi` by default. To run another build of pi, such as pi-bolt, set
+`MULTI_AGENT_PI_BIN` in the environment that starts it. Your agent's shell
+inherits the variable, and so do the agents it starts:
+
+```bash
+alias pi-bolt='MULTI_AGENT_PI_BIN=pi-bolt pi-bolt'
+```
+
 ## Features
 
 - **Small token cost.** A subagent extension adds its tool definitions to

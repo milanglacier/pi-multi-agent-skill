@@ -276,6 +276,14 @@ def pi_bin():
     return os.environ.get("MULTI_AGENT_PI_BIN") or "pi"
 
 
+def check_pi_bin():
+    if not shutil.which(pi_bin()):
+        raise CommandError(
+            f'cannot find the pi program "{pi_bin()}"; '
+            "set MULTI_AGENT_PI_BIN to the command that starts pi"
+        )
+
+
 def find_session_file(session_dir, name):
     """pi names a session file `<timestamp>_<id>.jsonl`; the timestamp has no `_`."""
     pattern = re.compile(r"^[^_]+_" + re.escape(name) + r"\.jsonl$")
@@ -1574,6 +1582,7 @@ def cmd_run(argv):
         if not os.path.isfile(fork):
             raise CommandError(f"--fork: PI_SESSION_FILE does not exist: {fork}")
     depth = check_depth()
+    check_pi_bin()
     profile = find_profile(cwd, args.values.get("--profile") or DEFAULT_PROFILE)
 
     root = jobs_dir(project)
@@ -1657,6 +1666,7 @@ def cmd_resume(argv):
     prompt = read_message(args, "prompt")
     job_dir = find_job(name)
     check_depth()
+    check_pi_bin()
     # A runner holds the lock while the job runs, so taking it proves that
     # nothing runs, and keeps it so until the new runner holds it.
     lock_fd = job_lock(
@@ -1920,8 +1930,9 @@ def cmd_status(argv):
         ("session_file", sessions[-1] if sessions else "-"),
         (
             "session_cmd",
-            "cd {} && pi --session-dir {} --session-id {}".format(
+            "cd {} && {} --session-dir {} --session-id {}".format(
                 shlex.quote(job.get("cwd", ".")),
+                shlex.quote(pi_bin()),
                 shlex.quote(session_dir),
                 shlex.quote(name),
             ),

@@ -713,15 +713,20 @@ class ForegroundTest(Base):
         self.assertIn("status: failed", result.stdout)
 
     def test_missing_pi(self):
-        result = self.cli(
-            "run",
-            "--name",
-            "nopi",
-            "x",
-            env={"MULTI_AGENT_PI_BIN": os.path.join(self.tmp, "no-such-pi")},
-        )
+        missing = {"MULTI_AGENT_PI_BIN": "no-such-pi"}
+        result = self.cli("run", "--name", "nopi", "x", env=missing)
         self.assertEqual(result.returncode, 1)
-        self.assertIn("could not start", result.stdout)
+        self.assertIn('cannot find the pi program "no-such-pi"', result.stderr)
+        self.assertIn("MULTI_AGENT_PI_BIN", result.stderr)
+        self.assertFalse(
+            glob.glob(os.path.join(self.tmp, "state", "*", "*", "jobs", "nopi"))
+        )
+        self.assertEqual(self.cli("run", "--name", "nopi", "x").returncode, 0)
+        result = self.cli("resume", "nopi", "y", env=missing)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("MULTI_AGENT_PI_BIN", result.stderr)
+        session_cmd = f"{shlex.quote(FAKE_PI)} --session-dir"
+        self.assertIn(session_cmd, self.cli("status", "nopi").stdout)
 
     def test_unicode_line_separators(self):
         env = {"FAKE_PI_TOOL": "echo a b", "FAKE_PI_REPLY": "first second third"}
