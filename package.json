@@ -24,7 +24,8 @@
     "skills/multi-agent/references/*.md",
     "skills/multi-agent/scripts/*.py",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "CHANGELOG.md"
   ],
   "pi": {
     "skills": [
