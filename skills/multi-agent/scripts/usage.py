@@ -238,7 +238,12 @@ def read_session_file(path: Path):
             if not isinstance(usage, dict):
                 continue
             provider = str(message.get("provider") or current_provider or "")
-            model = str(message.get("model") or current_model or "")
+            model = str(
+                message.get("responseModel")
+                or message.get("model")
+                or current_model
+                or ""
+            )
             record = make_record(timestamp or header_time, usage, provider, model, True)
             if record is not None:
                 records.append(record)
@@ -254,6 +259,9 @@ def read_session_file(path: Path):
             )
             if record is not None:
                 records.append(record)
+    if header.get("parentSession") and header_time is not None:
+        # Forks copy older usage timestamps; keep only usage from this session.
+        records = [record for record in records if record.timestamp >= header_time]
     return header, records, bad_lines, header_time
 
 
@@ -554,7 +562,7 @@ def determine_range(view: str, args, sessions: list, tz: ZoneInfo | None):
     if args.all:
         if args.until is None and last is not None:
             end = max(end, last)
-        start = args.since or (first if first is not None else end)
+        start = args.since or (min(first, end) if first is not None else end)
         return start, end, view in TIME_VIEWS or bool(args.since or args.until)
     if view in TIME_VIEWS:
         if args.since is not None:
@@ -566,9 +574,9 @@ def determine_range(view: str, args, sessions: list, tz: ZoneInfo | None):
         else:
             start = add_months(month_start(end), -(args.months - 1))
         return start, end, True
-    start = args.since or (first if first is not None else end)
     if args.until is None and last is not None:
         end = max(end, last)
+    start = args.since or (min(first, end) if first is not None else end)
     return start, end, bool(args.since or args.until)
 
 

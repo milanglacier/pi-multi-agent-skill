@@ -46,7 +46,9 @@ class UsageTests(unittest.TestCase):
             code = usage_report.main(list(args))
         return code, output.getvalue(), error.getvalue()
 
-    def write_session(self, slug, name, cwd, entries, stamp=None, start=None):
+    def write_session(
+        self, slug, name, cwd, entries, stamp=None, start=None, parent_session=None
+    ):
         stamp = stamp or "2026-01-01T00-00-00-000Z"
         start = start or "2026-01-01T00:00:00Z"
         header = {
@@ -56,6 +58,8 @@ class UsageTests(unittest.TestCase):
             "timestamp": start,
             "cwd": cwd,
         }
+        if parent_session is not None:
+            header["parentSession"] = parent_session
         lines = [json.dumps(header), *[json.dumps(entry) for entry in entries]]
         directory = self.sessions_dir / slug
         directory.mkdir(parents=True, exist_ok=True)
@@ -326,6 +330,67 @@ class UsageTests(unittest.TestCase):
         self.assertEqual(data["totals"]["sessions"], 1)
         self.assertEqual([row["label"] for row in data["rows"]], ["/tmp/alpha"])
 
+    def test_cutoffs_before_first_record_return_empty_reports(self):
+        self.write_session(
+            "slug-a",
+            "alpha",
+            "/tmp/project",
+            [self.assistant("2026-01-02T10:00:00Z", cost=0.1)],
+        )
+        for view in usage_report.VIEWS:
+            for options in ([], ["--all"]):
+                with self.subTest(view=view, options=options):
+                    code, output, error = self.run_report(
+                        view,
+                        *options,
+                        "--until",
+                        "2026-01-01",
+                        "--timezone",
+                        "UTC",
+                        "--json",
+                    )
+                    self.assertEqual(code, 0, error)
+                    data = json.loads(output)
+                    self.assertEqual(data["totals"]["sessions"], 0)
+                    self.assertEqual(data["totals"]["total_tokens"], 0)
+                    self.assertEqual(data["totals"]["cost"], 0.0)
+                    self.assertLessEqual(
+                        data["period"]["since"], data["period"]["until"]
+                    )
+                    self.assertTrue(all(row["sessions"] == 0 for row in data["rows"]))
+
+        code, output, error = self.run_report("project", "--until", "2026-01-01")
+        self.assertEqual(code, 0, error)
+        self.assertIn("No sessions match the filters", output)
+
+    def test_cutoff_on_first_record_date_includes_usage(self):
+        self.write_session(
+            "slug-a",
+            "alpha",
+            "/tmp/project",
+            [self.assistant("2026-01-02T10:00:00Z", cost=0.1)],
+        )
+        for options in ([], ["--all"]):
+            with self.subTest(options=options):
+                code, output, error = self.run_report(
+                    "project",
+                    *options,
+                    "--until",
+                    "2026-01-02",
+                    "--timezone",
+                    "UTC",
+                    "--json",
+                )
+                self.assertEqual(code, 0, error)
+                data = json.loads(output)
+                self.assertEqual(data["totals"]["sessions"], 1)
+                self.assertEqual(data["totals"]["cost"], 0.1)
+
+    def test_explicit_start_after_end_is_still_an_error(self):
+        with self.assertRaises(SystemExit) as error:
+            self.run_report("project", "--since", "2026-01-02", "--until", "2026-01-01")
+        self.assertEqual(error.exception.code, 2)
+
     def test_limit_keeps_totals_and_zero_means_all(self):
         for index in range(3):
             self.write_session(
@@ -454,6 +519,93 @@ class UsageTests(unittest.TestCase):
         self.assertEqual(data["rows"][0]["sessions"], 1)
         self.assertEqual(data["rows"][0]["turns"], 2)
         self.assertAlmostEqual(data["rows"][0]["cost"], 0.3)
+
+    def test_fork_excludes_inherited_usage_and_keeps_model_selection(self):
+        entries = [
+            {
+                "type": "model_change",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "provider": "test",
+                "modelId": "model-a",
+            }
+        ]
+        for timestamp, cost in (
+            ("2026-01-01T12:00:00Z", 1.0),
+            ("2026-01-02T00:00:00Z", 0.25),
+        ):
+            entries.append(self.assistant(timestamp, cost=cost))
+            for kind in ("usage", "compaction", "branch_summary"):
+                entry = self.usage_entry(timestamp, cost=cost)
+                entry["type"] = kind
+                del entry["provider"]
+                del entry["model"]
+                entries.append(entry)
+        self.write_session(
+            "slug-a",
+            "fork",
+            "/tmp/project",
+            entries,
+            start="2026-01-02T00:00:00Z",
+            parent_session=str(self.tmp / "outside" / "missing-parent.jsonl"),
+        )
+
+        code, output, error = self.run_report("session", "--timezone", "UTC", "--json")
+
+        self.assertEqual(code, 0, error)
+        self.assertEqual(error, "")
+        data = json.loads(output)
+        self.assertEqual(data["totals"]["sessions"], 1)
+        self.assertEqual(data["totals"]["turns"], 1)
+        self.assertEqual(data["totals"]["total_tokens"], 40)
+        self.assertEqual(data["totals"]["cost"], 1.0)
+        self.assertEqual(data["rows"][0]["models"], ["test/model-a"])
+        self.assertEqual(data["rows"][0]["started_at"], "2026-01-02T00:00:00+00:00")
+
+    def test_timestamp_filter_requires_a_fork_and_valid_header_time(self):
+        for name, parent, start in (
+            ("ordinary", None, "2026-01-02T00:00:00Z"),
+            ("unknown-start", "/missing-parent.jsonl", "invalid"),
+        ):
+            with self.subTest(name=name):
+                self.write_session(
+                    "slug-a",
+                    name,
+                    "/tmp/project",
+                    [self.assistant("2026-01-01T12:00:00Z", cost=1.0)],
+                    start=start,
+                    parent_session=parent,
+                )
+                path = next((self.sessions_dir / "slug-a").glob(f"*_{name}.jsonl"))
+                _, records, _, _ = usage_report.read_session_file(path)
+                self.assertEqual(len(records), 1)
+                self.assertEqual(records[0].cost, 1.0)
+
+    def test_concrete_response_models_are_grouped_separately(self):
+        entries = []
+        for response_model, cost in (("model-a", 0.1), ("model-b", 0.2), (None, 0.3)):
+            entry = self.assistant("2026-01-02T12:00:00Z", model="auto", cost=cost)
+            if response_model is not None:
+                entry["message"]["responseModel"] = response_model
+            entries.append(entry)
+        self.write_session("slug-a", "alpha", "/tmp/project", entries)
+
+        code, output, error = self.run_report("model", "--timezone", "UTC", "--json")
+
+        self.assertEqual(code, 0, error)
+        data = json.loads(output)
+        rows = {row["label"]: row for row in data["rows"]}
+        self.assertEqual(set(rows), {"test/model-a", "test/model-b", "test/auto"})
+        self.assertEqual(rows["test/model-a"]["cost"], 0.1)
+        self.assertEqual(rows["test/model-b"]["cost"], 0.2)
+        self.assertEqual(rows["test/auto"]["cost"], 0.3)
+        self.assertAlmostEqual(data["totals"]["cost"], 0.6)
+
+        code, output, error = self.run_report("session", "--timezone", "UTC", "--json")
+        self.assertEqual(code, 0, error)
+        self.assertEqual(
+            json.loads(output)["rows"][0]["models"],
+            ["test/auto", "test/model-a", "test/model-b"],
+        )
 
     def test_missing_cost_is_reported_as_unpriced(self):
         self.write_session(

@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- A standalone multi-agent usage report shows token counts and recorded costs by date, project, job, model and profile.
+
+### Fixed
+
+- Forked sessions exclude usage from before their creation without reading parent sessions.
+- Model breakdowns use the concrete response model when pi records it.
+- Date cutoffs before the first usage record return empty reports instead of an invalid-range error.
+
 ## [0.2.0] - 2026-10-26
 
 ### Breaking Changes
