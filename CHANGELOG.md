@@ -4,7 +4,7 @@
 
 ### Added
 
-- A standalone multi-agent usage report shows token counts and recorded costs by date, project, job, model and profile.
+- A standalone multi-agent usage report shows token counts and recorded costs by date, project, job, model and profile. The skill tells the agent when to run it.
 
 ### Fixed
 

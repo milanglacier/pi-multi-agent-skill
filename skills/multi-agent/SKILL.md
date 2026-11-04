@@ -137,4 +137,5 @@ only when you need it:
   model, tools and system prompt are chosen.
 - `state.md`: where jobs and conversations are stored, and the agent's
   environment.
+- `usage.md`: token and cost report.
 - `troubleshooting.md`: error messages and what to do about them.
