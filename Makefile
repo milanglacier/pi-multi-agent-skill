@@ -3,6 +3,7 @@
 check:
 	uvx ruff check .
 	uvx ruff format --check .
+	uvx pyrefly check
 	python3 -m unittest discover tests
 
 check-full: check

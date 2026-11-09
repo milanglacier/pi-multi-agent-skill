@@ -10,6 +10,7 @@ from unittest.mock import patch
 spec = importlib.util.spec_from_file_location(
     "count_tokens", Path(__file__).resolve().parents[1] / "scripts" / "count_tokens.py"
 )
+assert spec is not None and spec.loader is not None
 count_tokens = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(count_tokens)
 

@@ -31,6 +31,7 @@ TIME_SCALE = "0.1"
 os.environ["PI_MULTI_AGENT_TIME_SCALE"] = TIME_SCALE
 
 _spec = importlib.util.spec_from_file_location("multi_agent", SCRIPT)
+assert _spec is not None and _spec.loader is not None
 ma = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ma)
 
@@ -74,7 +75,7 @@ def cpu_seconds(pid):
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="multi-agent-test-")
-        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
         self.project = os.path.join(self.tmp, "project")
         self.record = os.path.join(self.tmp, "record")
         self.agent_dir = os.path.join(self.tmp, "agent")
@@ -167,7 +168,7 @@ class Base(unittest.TestCase):
 
     def hold(self):
         """Return env that keeps fake-pi's run from settling, and a function that lets it settle."""
-        path = tempfile.mktemp(prefix="release-", dir=self.tmp)
+        path = os.path.join(tempfile.mkdtemp(prefix="release-", dir=self.tmp), "go")
 
         def release():
             open(path, "w").close()

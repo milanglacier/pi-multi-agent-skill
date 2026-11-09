@@ -12,6 +12,7 @@ pi recorded for each request; this script never computes prices itself.
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import re
@@ -23,10 +24,11 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 # Tables use a few Unicode characters, so write UTF-8 whatever the locale.
 for _stream in (sys.stdin, sys.stdout, sys.stderr):
-    try:
-        _stream.reconfigure(encoding="utf-8", errors="replace")
-    except (AttributeError, ValueError, OSError):
-        pass
+    if isinstance(_stream, io.TextIOWrapper):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
 
 UTC = timezone.utc  # noqa: UP017 - Python 3.9 has no datetime.UTC.
 
@@ -624,7 +626,7 @@ def time_rows(
 
 
 def project_rows(sessions: list, start: date, end: date, tz: ZoneInfo | None) -> list:
-    buckets = {}
+    buckets: dict[str, Bucket] = {}
     for session in sessions:
         key = session.project
         bucket = buckets.setdefault(key, Bucket())
@@ -671,7 +673,7 @@ def session_rows(sessions: list, start: date, end: date, tz: ZoneInfo | None) ->
 
 
 def model_rows(sessions: list, start: date, end: date, tz: ZoneInfo | None) -> list:
-    buckets = {}
+    buckets: dict[str, Bucket] = {}
     for session in sessions:
         for record in records_in_range(session, start, end, tz):
             key = record.model_label
@@ -686,7 +688,7 @@ def model_rows(sessions: list, start: date, end: date, tz: ZoneInfo | None) -> l
 
 
 def profile_rows(sessions: list, start: date, end: date, tz: ZoneInfo | None) -> list:
-    buckets = {}
+    buckets: dict[str, Bucket] = {}
     for session in sessions:
         key = session.profile
         bucket = buckets.setdefault(key, Bucket())

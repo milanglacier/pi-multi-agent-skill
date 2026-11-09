@@ -11,6 +11,7 @@
 import calendar
 import fcntl
 import hashlib
+import io
 import json
 import math
 import os
@@ -26,13 +27,15 @@ import sys
 import threading
 import time
 import traceback
+from typing import Any
 
 # Prompts, job state and agent output are UTF-8 whatever the caller's locale.
 for _stream in (sys.stdin, sys.stdout, sys.stderr):
-    try:
-        _stream.reconfigure(encoding="utf-8", errors="replace")
-    except (AttributeError, ValueError, OSError):
-        pass
+    if isinstance(_stream, io.TextIOWrapper):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
 
 SCRIPT_PATH = os.path.abspath(__file__)
 SKILL_DIR = os.path.dirname(os.path.dirname(SCRIPT_PATH))
@@ -170,7 +173,7 @@ def read_text(path, default=None):
         return default
 
 
-def read_json(path, default=None):
+def read_json(path, default=None) -> Any:
     text = read_text(path)
     if text is None:
         return default
@@ -317,7 +320,7 @@ def split_items(text):
     return [item.strip() for item in items if item.strip()]
 
 
-def parse_scalar(raw):
+def parse_scalar(raw) -> Any:
     value = raw.strip()
     if len(value) >= 2 and value[0] == value[-1] == '"':
         try:
@@ -378,7 +381,7 @@ def text_field(fields, key):
     return value or None
 
 
-def make_profile(name, fields, body, source, scope):
+def make_profile(name, fields, body, source, scope) -> dict[str, Any]:
     return {
         "name": name,
         "description": text_field(fields, "description") or name,
@@ -408,7 +411,7 @@ def load_profiles(cwd):
     A profile replaces lower ones of the same name as a whole; a disabled one
     hides them. Disabled entries stay in the map with enabled False.
     """
-    found = {}
+    found: dict[str, dict[str, Any]] = {}
     for scope, directory in profile_dirs(cwd):
         try:
             entries = sorted(os.listdir(directory))
@@ -846,21 +849,24 @@ class Runner:
         self.selector.register(self.server, selectors.EVENT_READ, "server")
 
     def read_caller(self):
+        fd = self.caller_fd
+        if fd is None:
+            return
         try:
-            data = os.read(self.caller_fd, 512)
+            data = os.read(fd, 512)
         except BlockingIOError:
             return
         except OSError:
             data = b""
         if not data:
             self.caller_gone = True
-            self.selector.unregister(self.caller_fd)
-            os.close(self.caller_fd)
+            self.selector.unregister(fd)
+            os.close(fd)
             self.caller_fd = None
 
     def start(self):
         with open(job_path(self.job_dir, "stderr.txt"), "wb") as stderr_fh:
-            self.proc = subprocess.Popen(
+            proc = subprocess.Popen(
                 pi_argv(self.job_dir, self.job),
                 cwd=self.job["cwd"],
                 env=child_env(self.job_dir, self.job),
@@ -871,12 +877,14 @@ class Runner:
                 # group never reach it; the runner stops it through its stdin.
                 start_new_session=True,
             )
+        self.proc = proc
         self.stdin_open = True
-        self.out_fd = self.proc.stdout.fileno()
+        assert proc.stdout is not None
+        self.out_fd = proc.stdout.fileno()
         self.selector.register(self.out_fd, selectors.EVENT_READ, "pi")
 
     def send(self, obj):
-        if not self.stdin_open:
+        if not self.stdin_open or self.proc is None or self.proc.stdin is None:
             return False
         try:
             self.proc.stdin.write(json.dumps(obj).encode("utf-8") + b"\n")
@@ -909,7 +917,7 @@ class Runner:
         ):
             if key.data == "wake":
                 try:
-                    while os.read(self.wake_r, 512):
+                    while os.read(key.fd, 512):
                         pass
                 except OSError:
                     pass
@@ -923,13 +931,15 @@ class Runner:
                 self.read_pi()
 
     def read_pi(self):
+        fd = self.out_fd
+        assert fd is not None
         try:
-            data = os.read(self.out_fd, 65536)
+            data = os.read(fd, 65536)
         except OSError:
             data = b""
         if not data:
             self.eof = True
-            self.selector.unregister(self.out_fd)
+            self.selector.unregister(fd)
             if self.buffer:
                 self.handle_line(self.buffer)
                 self.buffer = b""
@@ -1239,6 +1249,7 @@ class Runner:
         self.stop_pi()
         stderr = read_text(job_path(self.job_dir, "stderr.txt"), "") or ""
         tail = "\n".join(stderr.rstrip("\n").splitlines()[-20:])
+        assert self.proc is not None
         output = (
             f"pi exited before the run finished (exit status {self.proc.returncode})."
         )

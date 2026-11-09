@@ -15,6 +15,7 @@ ROOT = HERE.parent
 SCRIPT = ROOT / "skills" / "multi-agent" / "scripts" / "usage.py"
 
 _spec = importlib.util.spec_from_file_location("usage_report", SCRIPT)
+assert _spec is not None and _spec.loader is not None
 usage_report = importlib.util.module_from_spec(_spec)
 sys.modules[_spec.name] = usage_report
 _spec.loader.exec_module(usage_report)
@@ -521,7 +522,7 @@ class UsageTests(unittest.TestCase):
         self.assertAlmostEqual(data["rows"][0]["cost"], 0.3)
 
     def test_fork_excludes_inherited_usage_and_keeps_model_selection(self):
-        entries = [
+        entries: list[dict] = [
             {
                 "type": "model_change",
                 "timestamp": "2026-01-01T00:00:00Z",
